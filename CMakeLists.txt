@@ -1,0 +1,62 @@
+cmake_minimum_required(VERSION 3.14)
+
+project(
+    fork_union
+    VERSION 0.1.0
+    DESCRIPTION "Minimalistic C++ thread-pool designed for SIMT-style 'Fork-Join' parallelism"
+    LANGUAGES CXX
+)
+
+# enforce C++17
+set(PROJECT_CXX_STANDARD 17)
+set(PROJECT_CXX_EXTENSIONS OFF)
+set(PROJECT_CXX_STANDARD_REQUIRED ON)
+
+# header-only interface library
+add_library(fork_union INTERFACE)
+
+target_include_directories(
+    fork_union INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
+)
+
+# enable tests if requested
+include(CTest)
+if (BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(scripts)
+endif ()
+
+# install rules
+include(GNUInstallDirs)
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(
+    TARGETS fork_union
+    EXPORT fork_unionTargets
+    INCLUDES
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# export config files for find_package
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/fork_unionConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+
+configure_package_config_file(
+    cmake/fork_unionConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/fork_unionConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fork_union
+)
+
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/fork_unionConfig.cmake"
+              "${CMAKE_CURRENT_BINARY_DIR}/fork_unionConfigVersion.cmake"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fork_union
+)
+
+install(
+    EXPORT fork_unionTargets
+    NAMESPACE fork_union::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/fork_union
+)
