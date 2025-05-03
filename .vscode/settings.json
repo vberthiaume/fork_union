@@ -6,7 +6,9 @@
         "noexcept",
         "NUMA",
         "SIMT",
+        "STREQUAL",
         "syscall",
+        "TSAN",
         "Vardanian"
     ],
     "files.associations": {
