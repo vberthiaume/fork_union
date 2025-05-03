@@ -8,6 +8,7 @@
 #include <memory>  // `std::allocator`
 #include <thread>  // `std::thread`
 #include <atomic>  // `std::atomic`
+#include <cstddef> // `std::max_align_t`
 #include <cassert> // `assert`
 
 namespace ashvardanian {
@@ -43,13 +44,15 @@ class fork_union {
     allocator_t allocator_ {};
     std::thread *workers_ {nullptr};
     thread_index_t total_threads_ {0};
-    std::atomic<bool> stop_ {false};
+    alignas(std::max_align_t) std::atomic<bool> stop_ {false};
 
+    // Task-specific variables:
     punned_task_context_t task_lambda_pointer_ {nullptr};    // ? Pointer to the users lambda
     trampoline_pointer_t task_trampoline_pointer_ {nullptr}; // ? Calls the lambda
-    task_index_t task_size_ {0};
-    std::atomic<task_index_t> task_parts_remaining_ {0};
-    std::atomic<std::size_t> task_generation_ {0};
+    task_index_t task_parts_count_ {0};
+    alignas(std::max_align_t) std::atomic<task_index_t> task_parts_remaining_ {0};
+    alignas(std::max_align_t) std::atomic<task_index_t> task_parts_passed_ {0}; // ? Only used in eager mode
+    alignas(std::max_align_t) std::atomic<std::size_t> task_generation_ {0};
 
   public:
     fork_union(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
