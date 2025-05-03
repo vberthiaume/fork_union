@@ -27,20 +27,34 @@ template <typename allocator_type_ = std::allocator<std::byte>>
 class fork_union {
   public:
     using allocator_t = allocator_type_;
-    using task_index_t = std::size_t;
     using thread_index_t = std::size_t;
+    using task_index_t = std::size_t;
 
+    /**
+     *  @brief A POD-type describing a certain part of a parallel task.
+     *
+     *  User callbacks in a simple case receive just a single integer identifying the part
+     *  of the task to be executed. For more advanced use-cases, when the user needs to know
+     *  the thread ID (likely to use some thread-local storage), the callbacks should receive
+     *  a `task_t` argument, and unpack the thread ID from it.
+     */
     struct task_t {
-        task_index_t thread_index {0};
-        thread_index_t task_index {0};
+        thread_index_t thread_index {0};
+        task_index_t task_index {0};
 
         inline operator std::size_t() const noexcept { return task_index; }
     };
 
-  private:
     using punned_task_context_t = void const *;
     using trampoline_pointer_t = void (*)(punned_task_context_t, task_t const &);
 
+    struct c_thread_callback_t {
+        trampoline_pointer_t callable {nullptr};
+        punned_task_context_t context {nullptr};
+    };
+
+  private:
+    // Thread-pool-specific variables:
     allocator_t allocator_ {};
     std::thread *workers_ {nullptr};
     thread_index_t total_threads_ {0};
@@ -101,22 +115,24 @@ class fork_union {
     ~fork_union() noexcept {
         if (total_threads_ == 0) return;                                    // ? Uninitialized
         if (total_threads_ == 1) return;                                    // ? No worker threads to join
-        assert(task_parts_remaining_.load(std::memory_order_acquire) == 0); // ! No tasks must be running
-        stop_.store(true, std::memory_order_release);                       // ? Inform workers to stop
-        task_generation_.fetch_add(1, std::memory_order_release);           // ? Wake-up sleepers
-        for (thread_index_t i = 0; i < total_threads_ - 1; ++i) {
+        assert(task_parts_remaining_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
+
+        // Stop all threads and wait for them to finish
+        _reset_task();
+        stop_.store(true, std::memory_order_seq_cst);
+
+        thread_index_t const worker_threads = total_threads_ - 1;
+        for (thread_index_t i = 0; i != worker_threads; ++i) {
             workers_[i].join();    // ? Wait for the thread to finish
             workers_[i].~thread(); // ? Call destructor
         }
 
         // Deallocate the thread pool
-        allocator_.deallocate(workers_, total_threads_ - 1);
+        allocator_.deallocate(workers_, worker_threads);
 
         // We don't have to reset the following variables, but it's a good practice
         total_threads_ = 0;
         workers_ = nullptr;
-        task_lambda_pointer_ = nullptr;
-        task_trampoline_pointer_ = nullptr;
     }
 
     /**
@@ -126,7 +142,7 @@ class fork_union {
      */
     template <typename function_type_>
     void for_each(task_index_t const n, function_type_ const &function) noexcept {
-        return for_each_range(n, [function](task_t start_task, task_index_t count) noexcept {
+        for_each_range(n, [function](task_t start_task, task_index_t count) noexcept {
             for (task_index_t i = 0; i < count; ++i)
                 function(task_t {start_task.thread_index, start_task.task_index + i});
         });
@@ -146,7 +162,7 @@ class fork_union {
 
         // Divide and round-up the workload size per thread
         task_index_t const n_per_thread = (n + total_threads_ - 1) / total_threads_;
-        return for_each_thread([n, n_per_thread, function](thread_index_t thread_index) noexcept {
+        for_each_thread([n, n_per_thread, function](thread_index_t thread_index) noexcept {
             task_index_t const begin = thread_index * n_per_thread;
             task_index_t const count = std::min(n, begin + n_per_thread) - begin;
             function(task_t {thread_index, begin}, count);
@@ -164,12 +180,13 @@ class fork_union {
         // Store closure address
         task_lambda_pointer_ = std::addressof(function);
         task_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
-        task_size_ = total_threads_;
-        task_parts_remaining_.store(total_threads_ - 1, std::memory_order_release);
-        task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
+        task_parts_count_ = total_threads_;
+        task_parts_remaining_.store(total_threads_ - 1, std::memory_order_seq_cst);
+        task_generation_.fetch_add(1, std::memory_order_seq_cst); // ? Wake up sleepers
 
         function(0); // Execute on the current thread
-        while (task_parts_remaining_.load(std::memory_order_acquire) > 0) std::this_thread::yield();
+        while (task_parts_remaining_.load(std::memory_order_seq_cst)) std::this_thread::yield();
+        _reset_task();
     }
 
     /**
@@ -188,14 +205,22 @@ class fork_union {
         // Store closure address
         task_lambda_pointer_ = std::addressof(function);
         task_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
-        task_size_ = n;
-        task_parts_remaining_.store(n, std::memory_order_release);
-        task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
+        task_parts_count_ = n;
+        task_parts_passed_.store(0, std::memory_order_seq_cst);
+        task_parts_remaining_.store(n, std::memory_order_seq_cst);
+        task_generation_.fetch_add(1, std::memory_order_seq_cst); // ? Wake up sleepers
 
         _worker_loop_for_eager_task(0); // Execute on the current thread
+        _reset_task();
     }
 
   private:
+    void _reset_task() noexcept {
+        task_parts_count_ = 0;
+        task_lambda_pointer_ = nullptr;
+        task_trampoline_pointer_ = nullptr;
+    }
+
     /**
      *  @brief A trampoline function that is used to call the user-defined lambda.
      *  @param[in] punned_lambda_pointer The pointer to the user-defined lambda.
@@ -218,32 +243,38 @@ class fork_union {
             // Wait for either: a new ticket or a stop flag
             std::size_t new_task_generation;
             bool wants_to_stop;
-            while ((new_task_generation = task_generation_.load(std::memory_order_acquire)) == last_task_generation &&
-                   (wants_to_stop = stop_.load(std::memory_order_relaxed)) == false)
+            while ((new_task_generation = task_generation_.load(std::memory_order_seq_cst)) == last_task_generation &&
+                   (wants_to_stop = stop_.load(std::memory_order_seq_cst)) == false)
                 std::this_thread::yield();
 
             if (wants_to_stop) return;
 
-            last_task_generation = new_task_generation;
-
             // Check if we are operating in the "eager" or a more-balanced "parallel" mode
-            bool const one_part_per_thread = task_size_ == total_threads_;
-            if (one_part_per_thread) {
-                task_index_t const old = task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
-                assert(old > 0 && "We can't be here if there are no tasks left... and we'll underflow");
-                task_trampoline_pointer_(task_lambda_pointer_, {thread_index, old - 1});
+            bool const one_part_per_thread = task_parts_count_ == total_threads_;
+            if (one_part_per_thread && task_parts_count_) {
+                task_trampoline_pointer_(task_lambda_pointer_, {thread_index, thread_index});
+                // ! The decrement must come after the task is executed
+                task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_seq_cst);
+                assert(before_decrement > 0 && "We can't be here if there are no worker threads");
             }
             else { _worker_loop_for_eager_task(thread_index); }
+            last_task_generation = new_task_generation;
         }
     }
 
     void _worker_loop_for_eager_task(task_index_t const thread_index) noexcept {
+        // Unlike the thread-balanced mode, we need to keep track of the number of passed tasks.
+        // The traditional way to achieve that is to use the same single atomic `task_parts_remaining_`
+        // variable, but using `compare_exchange_weak` interfaces. It's much more expensive on modern
+        // CPUs, so we use an additional atomic variable and have 2x atomic increments of 2x atomic variables,
+        // instead of 1x atomic load and 1x atomic CAS on 1x atomic variable (in optimistic low-contention case).
         while (true) {
-            task_index_t const remaining = task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
-            bool const no_tasks_left = remaining == 0 || remaining > task_size_; // ? Check for underflow
-            if (no_tasks_left) break;
-            task_index_t const task_index = task_size_ - remaining;
-            task_trampoline_pointer_(task_lambda_pointer_, {thread_index, task_index});
+            task_index_t const new_task_index = task_parts_passed_.fetch_add(1, std::memory_order_seq_cst);
+            if (new_task_index >= task_parts_count_) break;
+            task_trampoline_pointer_(task_lambda_pointer_, {thread_index, new_task_index});
+            // ! The decrement must come after the task is executed
+            task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_seq_cst);
+            assert(before_decrement > 0 && "We can't be here if there are no tasks left");
         }
     }
 };

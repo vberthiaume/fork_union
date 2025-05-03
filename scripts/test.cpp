@@ -40,18 +40,21 @@ static bool test_for_each_thread() noexcept {
     return true;
 }
 
-/** @brief Make sure that `for_each` is called the right number of times with the right task IDs */
+/** @brief Make sure that `for_each` is called the right number of times with the right task IDs. */
 static bool test_for_each() noexcept {
-    av::fork_union_t pool;
-    auto const count_threads = std::thread::hardware_concurrency();
-    if (!pool.try_fork(count_threads)) return false;
     std::size_t const expected_parts = 1'000'000;
     std::vector<std::size_t> visited(expected_parts, 0);
     std::atomic<std::size_t> counter = 0;
-    pool.for_each(expected_parts, [&](std::size_t const task_index) noexcept {
-        std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-        visited[count_populated] = task_index;
-    });
+    {
+        av::fork_union_t pool;
+        auto const count_threads = std::thread::hardware_concurrency();
+        if (!pool.try_fork(count_threads)) return false;
+        pool.for_each(expected_parts, [&](std::size_t const task_index) noexcept {
+            // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+            std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
+            visited[count_populated] = task_index;
+        });
+    }
 
     // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
     std::sort(visited.begin(), visited.end());
@@ -60,7 +63,7 @@ static bool test_for_each() noexcept {
            visited.back() == (expected_parts - 1);
 }
 
-/** @brief Make sure that `eager` is called the right number of times with the right task IDs */
+/** @brief Make sure that `eager` is called the right number of times with the right task IDs. */
 static bool test_eager() noexcept {
     av::fork_union_t pool;
     auto const count_threads = std::thread::hardware_concurrency();
@@ -69,6 +72,7 @@ static bool test_eager() noexcept {
     std::vector<std::size_t> visited(expected_parts, 0);
     std::atomic<std::size_t> counter = 0;
     pool.eager(expected_parts, [&](std::size_t const task_index) noexcept {
+        // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
         visited[count_populated] = task_index;
     });
