@@ -2,7 +2,7 @@
 
 The __`fork_union`__ library is a thread-pool for "Fork-Join" [SIMT-style](https://en.wikipedia.org/wiki/Single_instruction,_multiple_threads) parallelism in modern C++.
 It's quite different from most open-source C++ thread-pool implementations, generally designed around a `std::queue` of `std::function` tasks, synchronized by a `std::mutex`.
-Wrapping tasks into `std::function` is expensive, so is growing the `std::queue` and locking the `std::mutex` under contention.
+Wrapping tasks into `std::function` is expensive, as is growing the `std::queue` and locking the `std::mutex` under contention.
 When you can avoid it - you should.
 OpenMP-like use-cases are the perfect example of that!
 
@@ -15,11 +15,18 @@ This is where __`fork_union`__ comes in with a minimalistic STL implementation o
 
 The __`fork_union`__ supports just 2 operation modes:
 
-- __"Static"__ - where the tasks are distributed evenly across the threads and have comparable runtimes.
-- __"Dynamic"__ - where the tasks are distributed unevenly across the threads, and each thread greedily steals tasks from the others.
+- __"Static"__ - even slicing for tasks with uniform cost.
+- __"Dynamic"__ - work-stealing for uneven workloads.
 
 There is no nested parallelism, exception-handling, or "futures promises".
-To integrate into your project, either just copy the `fork_union.hpp` file into your project, add a Git submodule, or CMake:
+To integrate into your project, either just copy the `fork_union.hpp` file into your project, add a Git submodule, or CMake.
+For a Git submodule, run:
+
+```bash
+git submodule add https://github.com/ashvardanian/fork_union.git extern/fork_union
+```
+
+Alternatively, using CMake:
 
 ```cmake
 FetchContent_Declare(
@@ -28,9 +35,10 @@ FetchContent_Declare(
     https://github.com/ashvardanian/fork_union
 )
 FetchContent_MakeAvailable(fork_union)
+target_link_libraries(your_target PRIVATE fork_union::fork_union)
 ```
 
-Then, in your C++ code:
+Then, include the header in your C++ code:
 
 ```cpp
 #include <fork_union.hpp>   // `fork_union_t`
@@ -89,17 +97,17 @@ There are many other thread-pool implementations, that are more feature-rich, bu
 - [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool) ![https://github.com/mtrebi/thread-pool](https://img.shields.io/github/stars/mtrebi/thread-pool)
 
 Those are not designed for the same OpenMP-like use-cases as __`fork_union`__.
-Instead, they primarily focus on task-queueing, that requires a lot more work.
+Instead, they primarily focus on task queueing, which requires a lot more work.
 
 ### Locks and Mutexes
 
 Unlike the `std::atomic`, the `std::mutex` is a system call, and it can be expensive to acquire and release.
-It's implementations generally have 2 executable paths:
+Its implementations generally have 2 executable paths:
 
 - the fast path, where the mutex is not contended, where it first tries to grab the mutex via a compare-and-swap operation, and if it succeeds, it returns immediately.
 - the slow path, where the mutex is contended, and it has to go through the kernel to block the thread until the mutex is available.
 
-On Linux the latter translates to a ["futex" syscall](https://en.wikipedia.org/wiki/Futex), which is expensive.
+On Linux, the latter translates to a ["futex" syscall](https://en.wikipedia.org/wiki/Futex), which is expensive.
 
 ### Memory Allocations
 
@@ -124,12 +132,18 @@ In practice, a locked atomic on x86 requires the cache line in the Exclusive sta
 This will incur a coherence transaction (Read-for-Ownership) if some other core had the line.
 Both Intel and AMD handle this similarly.
 
-It makes [Arm and Power much more suitable for lock-free programming](https://arangodb.com/2021/02/cpp-memory-model-migrating-from-x86-to-arm/) and concurrent data structures, but some observations hold true for both platforms.
+It makes [Arm and Power much more suitable for lock-free programming](https://arangodb.com/2021/02/cpp-memory-model-migrating-from-x86-to-arm/) and concurrent data structures, but some observations hold for both platforms.
 Most importantly, "Compare and Swap" (CAS) is a very expensive operation, and should be avoided at all costs.
 
 On x86, for example, the `LOCK ADD` [can easily take 50 CPU cycles](https://travisdowns.github.io/blog/2020/07/06/concurrency-costs), being 50x slower than a regular `ADD` instruction, but still easily 5-10x faster than a `LOCK CMPXCHG` instruction.
 Once the contention rises, the gap naturally widens, and is further amplified by the increased "failure" rate of the CAS operation, when the value being compared has already changed.
 That's why for the "dynamic" mode, we resort to using an additional atomic variable as opposed to more typical CAS-based implementations.
+
+### Alignment
+
+Assuming a thread-pool is a heavy object anyway, nobody will care if it's a bit larger than expected.
+That allows us to over-align the internal counters to `std::max_align_t` to avoid false sharing.
+In that case, even on x86, where the entire cache will be exclusively owned by a single thread, in eager mode, we end up effectively "pipelining" the execution, where one thread may be incrementing the "in-flight" counter, while the other is decrementing the "remaining" counter, and others are executing the loop body in-between.
 
 ## Testing
 
