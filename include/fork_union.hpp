@@ -22,6 +22,14 @@ namespace ashvardanian {
  *  It avoids heap allocations and expensive abstractions like `std::function`, `std::future`,
  *  `std::promise`, `std::condition_variable`, etc. It only uses `std::thread` and `std::atomic`,
  *  benefiting from the fact, that those are standardized since C++11.
+ *
+ *  Note, that "stopping" isn't done at a sub-task granularity level. So if you are submitting
+ *  a huge task in an eager mode, it's up to you to abrupt it early with extra logic.
+ *
+ *  Most operations are performed with a "weak" memory model, to be able to leverage in-hardware
+ *  support for atomic fence-less operations on Arm and Power architectures. Most atomic counters
+ *  use the "acquire-release" model, and some going further to "relaxed" model.
+ *  @see https://en.cppreference.com/w/cpp/atomic/memory_order#Release-Acquire_ordering
  */
 template <typename allocator_type_ = std::allocator<std::byte>>
 class fork_union {
@@ -119,7 +127,7 @@ class fork_union {
 
         // Stop all threads and wait for them to finish
         _reset_task();
-        stop_.store(true, std::memory_order_seq_cst);
+        stop_.store(true, std::memory_order_release);
 
         thread_index_t const worker_threads = total_threads_ - 1;
         for (thread_index_t i = 0; i != worker_threads; ++i) {
@@ -181,11 +189,16 @@ class fork_union {
         task_lambda_pointer_ = std::addressof(function);
         task_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
         task_parts_count_ = total_threads_;
-        task_parts_remaining_.store(total_threads_ - 1, std::memory_order_seq_cst);
-        task_generation_.fetch_add(1, std::memory_order_seq_cst); // ? Wake up sleepers
+        task_parts_remaining_.store(total_threads_ - 1, std::memory_order_relaxed);
+        task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
-        function(0); // Execute on the current thread
-        while (task_parts_remaining_.load(std::memory_order_seq_cst)) std::this_thread::yield();
+        // Execute on the current thread
+        function(0);
+
+        // Wait until all threads are done
+        while (task_parts_remaining_.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // An optional reset of the task variables for debuggability
         _reset_task();
     }
 
@@ -206,9 +219,9 @@ class fork_union {
         task_lambda_pointer_ = std::addressof(function);
         task_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
         task_parts_count_ = n;
-        task_parts_passed_.store(0, std::memory_order_seq_cst);
-        task_parts_remaining_.store(n, std::memory_order_seq_cst);
-        task_generation_.fetch_add(1, std::memory_order_seq_cst); // ? Wake up sleepers
+        task_parts_passed_.store(0, std::memory_order_relaxed);
+        task_parts_remaining_.store(n, std::memory_order_relaxed);
+        task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current thread
         _worker_loop_for_eager_task(0);
@@ -251,8 +264,8 @@ class fork_union {
             // Wait for either: a new ticket or a stop flag
             std::size_t new_task_generation;
             bool wants_to_stop;
-            while ((new_task_generation = task_generation_.load(std::memory_order_seq_cst)) == last_task_generation &&
-                   (wants_to_stop = stop_.load(std::memory_order_seq_cst)) == false)
+            while ((new_task_generation = task_generation_.load(std::memory_order_relaxed)) == last_task_generation &&
+                   (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
                 std::this_thread::yield();
 
             if (wants_to_stop) return;
@@ -262,7 +275,7 @@ class fork_union {
             if (one_part_per_thread && task_parts_count_) {
                 task_trampoline_pointer_(task_lambda_pointer_, {thread_index, thread_index});
                 // ! The decrement must come after the task is executed
-                task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_seq_cst);
+                task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_relaxed);
                 assert(before_decrement > 0 && "We can't be here if there are no worker threads");
             }
             else { _worker_loop_for_eager_task(thread_index); }
@@ -277,11 +290,12 @@ class fork_union {
         // CPUs, so we use an additional atomic variable and have 2x atomic increments of 2x atomic variables,
         // instead of 1x atomic load and 1x atomic CAS on 1x atomic variable (in optimistic low-contention case).
         while (true) {
-            task_index_t const new_task_index = task_parts_passed_.fetch_add(1, std::memory_order_seq_cst);
+            // The relative order of executed tasks doesn't matter here, so we can use relaxed memory order.
+            task_index_t const new_task_index = task_parts_passed_.fetch_add(1, std::memory_order_relaxed);
             if (new_task_index >= task_parts_count_) break;
             task_trampoline_pointer_(task_lambda_pointer_, {thread_index, new_task_index});
             // ! The decrement must come after the task is executed
-            task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_seq_cst);
+            task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_relaxed);
             assert(before_decrement > 0 && "We can't be here if there are no tasks left");
         }
     }
