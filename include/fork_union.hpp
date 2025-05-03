@@ -11,6 +11,16 @@
 #include <cstddef> // `std::max_align_t`
 #include <cassert> // `assert`
 
+/**
+ *  On C++17 and later we can detect misuse of lambdas that are not properly annotated.
+ *  On C++20 and later we can use concepts for cleaner compile-time checks.
+ */
+#define _FORK_UNION_DETECT_CPP_20 (__cplusplus >= 202002L)
+#define _FORK_UNION_DETECT_CPP_17 (__cplusplus >= 201703L)
+#if _FORK_UNION_DETECT_CPP_17
+#include <type_traits> // `std::is_nothrow_invocable_r`
+#endif
+
 namespace ashvardanian {
 
 /**
@@ -162,6 +172,14 @@ class fork_union {
      */
     template <typename function_type_>
     void for_each_static(task_index_t const n, function_type_ const &function) noexcept {
+
+#if _FORK_UNION_DETECT_CPP_17
+        // ? Exception handling and aggregating return values drastically increases code complexity
+        static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t>::value ||
+                       std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value),
+                      "The callback must be invocable with a `task_t` or a `task_index_t` argument");
+#endif
+
         for_each_slice(n, [function](task_t start_task, task_index_t count) noexcept {
             for (task_index_t i = 0; i < count; ++i)
                 function(task_t {start_task.thread_index, start_task.task_index + i});
@@ -175,6 +193,13 @@ class fork_union {
      */
     template <typename function_type_>
     void for_each_slice(task_index_t const n, function_type_ const &function) noexcept {
+
+#if _FORK_UNION_DETECT_CPP_17
+        // ? Exception handling and aggregating return values drastically increases code complexity
+        static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t, task_index_t>::value ||
+                       std::is_nothrow_invocable_r<void, function_type_, task_index_t, task_index_t>::value),
+                      "The callback must be invocable with a `task_t` or a `task_index_t` argument");
+#endif
 
         // No need to slice the workload if we only have one thread
         assert(total_threads_ != 0 && "Thread pool not initialized");
@@ -196,6 +221,12 @@ class fork_union {
     template <typename function_type_>
     void for_each_thread(function_type_ const &function) noexcept {
         if (total_threads_ == 1) return function(0);
+
+#if _FORK_UNION_DETECT_CPP_17
+        // ? Exception handling and aggregating return values drastically increases code complexity
+        static_assert(std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value,
+                      "The callback must be invocable with a `task_index_t` argument");
+#endif
 
         // Store closure address
         task_lambda_pointer_ = std::addressof(function);
@@ -222,6 +253,14 @@ class fork_union {
      */
     template <typename function_type_>
     void for_each_dynamic(task_index_t const n, function_type_ const &function) noexcept {
+
+#if _FORK_UNION_DETECT_CPP_17
+        // ? Exception handling and aggregating return values drastically increases code complexity
+        static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t>::value ||
+                       std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value),
+                      "The callback must be invocable with a `task_t` or a `task_index_t` argument");
+#endif
+
         // If there is just one thread, all work is done on the current thread
         if (total_threads_ == 1) {
             for (task_index_t i = 0; i < n; ++i) function(task_t {0, i});
