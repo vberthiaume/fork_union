@@ -24,7 +24,7 @@ namespace ashvardanian {
  *  benefiting from the fact, that those are standardized since C++11.
  *
  *  Note, that "stopping" isn't done at a sub-task granularity level. So if you are submitting
- *  a huge task in an eager mode, it's up to you to abrupt it early with extra logic.
+ *  a huge task in a "dynamic" eager mode, it's up to you to abrupt it early with extra logic.
  *
  *  Most operations are performed with a "weak" memory model, to be able to leverage in-hardware
  *  support for atomic fence-less operations on Arm and Power architectures. Most atomic counters
@@ -73,7 +73,7 @@ class fork_union {
     trampoline_pointer_t task_trampoline_pointer_ {nullptr}; // ? Calls the lambda
     task_index_t task_parts_count_ {0};
     alignas(std::max_align_t) std::atomic<task_index_t> task_parts_remaining_ {0};
-    alignas(std::max_align_t) std::atomic<task_index_t> task_parts_passed_ {0}; // ? Only used in eager mode
+    alignas(std::max_align_t) std::atomic<task_index_t> task_parts_passed_ {0}; // ? Only used in dynamic mode
     alignas(std::max_align_t) std::atomic<std::size_t> task_generation_ {0};
 
   public:
@@ -93,7 +93,7 @@ class fork_union {
      *  @retval false if the number of threads is zero or the "workers" allocation failed.
      *  @retval true if the thread-pool was created successfully, started, and is ready to use.
      */
-    bool try_fork(std::size_t const planned_threads) noexcept {
+    bool try_spawn(std::size_t const planned_threads) noexcept {
         if (planned_threads == 0) return false; // ! Can't have zero threads working on something
         if (planned_threads == 1) return true;  // ! The current thread will always be used
         if (total_threads_ != 0) return false;  // ! Already initialized
@@ -156,13 +156,13 @@ class fork_union {
      *  @param[in] function The callback, receiving @b `task_t` or the task index as an argument.
      *
      *  Is designed for a "balanced" workload, where all threads have roughly the same amount of work.
-     *  @sa `eager` for a more dynamic workload.
+     *  @sa `for_each_dynamic` for a more dynamic workload.
      *  The @p function is called @p (n) times, and each thread receives a slice of consecutive tasks.
-     *  @sa `for_each_range` if you prefer to receive workload slices over individual indices.
+     *  @sa `for_each_slice` if you prefer to receive workload slices over individual indices.
      */
     template <typename function_type_>
-    void for_each(task_index_t const n, function_type_ const &function) noexcept {
-        for_each_range(n, [function](task_t start_task, task_index_t count) noexcept {
+    void for_each_static(task_index_t const n, function_type_ const &function) noexcept {
+        for_each_slice(n, [function](task_t start_task, task_index_t count) noexcept {
             for (task_index_t i = 0; i < count; ++i)
                 function(task_t {start_task.thread_index, start_task.task_index + i});
         });
@@ -174,7 +174,7 @@ class fork_union {
      *  @param[in] function The callback, receiving @b `task_t` or an unsigned integer and the slice length.
      */
     template <typename function_type_>
-    void for_each_range(task_index_t const n, function_type_ const &function) noexcept {
+    void for_each_slice(task_index_t const n, function_type_ const &function) noexcept {
 
         // No need to slice the workload if we only have one thread
         assert(total_threads_ != 0 && "Thread pool not initialized");
@@ -218,10 +218,10 @@ class fork_union {
      *  @brief Executes uneven tasks on all threads, greedying for work.
      *  @param[in] n The number of times to call the @p function.
      *  @param[in] function The callback, receiving the `task_t` or the task index as an argument.
-     *  @sa `for_each` for a more "balanced" evenly-splittable workload.
+     *  @sa `for_each_static` for a more "balanced" evenly-splittable workload.
      */
     template <typename function_type_>
-    void eager(task_index_t const n, function_type_ const &function) noexcept {
+    void for_each_dynamic(task_index_t const n, function_type_ const &function) noexcept {
         // If there is just one thread, all work is done on the current thread
         if (total_threads_ == 1) {
             for (task_index_t i = 0; i < n; ++i) function(i);
@@ -237,7 +237,7 @@ class fork_union {
         task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current thread
-        _worker_loop_for_eager_task(0);
+        _worker_loop_for_dynamic_tasks(0);
 
         // We may be in the in-flight position, where the current thread is already receiving
         // tasks beyond the `task_parts_count_` index, but the worker threads are still executing
@@ -283,20 +283,20 @@ class fork_union {
 
             if (wants_to_stop) return;
 
-            // Check if we are operating in the "eager" or a more-balanced "parallel" mode
-            bool const one_part_per_thread = task_parts_count_ == total_threads_;
-            if (one_part_per_thread && task_parts_count_) {
+            // Check if we are operating in the "dynamic" eager mode or a balanced "static" mode
+            bool const is_static = task_parts_count_ == total_threads_;
+            if (is_static && task_parts_count_) {
                 task_trampoline_pointer_(task_lambda_pointer_, {thread_index, thread_index});
                 // ! The decrement must come after the task is executed
                 task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
                 assert(before_decrement > 0 && "We can't be here if there are no worker threads");
             }
-            else { _worker_loop_for_eager_task(thread_index); }
+            else { _worker_loop_for_dynamic_tasks(thread_index); }
             last_task_generation = new_task_generation;
         }
     }
 
-    void _worker_loop_for_eager_task(task_index_t const thread_index) noexcept {
+    void _worker_loop_for_dynamic_tasks(task_index_t const thread_index) noexcept {
         // Unlike the thread-balanced mode, we need to keep track of the number of passed tasks.
         // The traditional way to achieve that is to use the same single atomic `task_parts_remaining_`
         // variable, but using `compare_exchange_weak` interfaces. It's much more expensive on modern

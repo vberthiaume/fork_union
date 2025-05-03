@@ -15,8 +15,8 @@ This is where __`fork_union`__ comes in with a minimalistic STL implementation o
 
 The __`fork_union`__ supports just 2 operation modes:
 
-- __Balanced__ - where the tasks are distributed evenly across the threads and have comparable runtimes.
-- __Eager__ - where the tasks are distributed unevenly across the threads, and each thread greedily steals tasks from the others.
+- __"Static"__ - where the tasks are distributed evenly across the threads and have comparable runtimes.
+- __"Dynamic"__ - where the tasks are distributed unevenly across the threads, and each thread greedily steals tasks from the others.
 
 There is no nested parallelism, exception-handling, or "futures promises".
 To integrate into your project, either just copy the `fork_union.hpp` file into your project, add a Git submodule, or CMake:
@@ -41,14 +41,14 @@ namespace av = ashvardanian;
 
 int main() {
     av::fork_union_t pool;
-    if (!pool.try_fork(std::thread::hardware_concurrency())) {
+    if (!pool.try_spawn(std::thread::hardware_concurrency())) {
         std::fprintf(stderr, "Failed to fork the threads\n");
         return EXIT_FAILURE;
     }
 
     // Dispatch a callback to each thread in the pool
-    pool.for_each_thread([](std::size_t thread_index) noexcept {
-        std::printf("Hello from thread %zu\n", thread_index);
+    pool.for_each_thread([&](std::size_t thread_index) noexcept {
+        std::printf("Hello from thread # %zu (of %zu)\n", thread_index + 1, pool.count_threads());
     });
 
     // Execute 1000 tasks in parallel, expecting them to have comparable runtimes
@@ -58,20 +58,20 @@ int main() {
     //      for (int i = 0; i < 1000; ++i) { ... }
     //
     // You can also think about it as a shortcut for the `for_each_slice` + `for`.
-    pool.for_each(1000, [](std::size_t task_index) noexcept {
+    pool.for_each_static(1000, [](std::size_t task_index) noexcept {
         std::printf("Running task %zu of 3\n", task_index + 1);
     });
     pool.for_each_slice(1000, [](std::size_t first_index, std::size_t count) noexcept {
         std::printf("Running slice [%zu, %zu)\n", first_index, first_index + count);
     });
 
-    // Like `for_each`, but each thread greedily steals tasks, without waiting for  
+    // Like `for_each_static`, but each thread greedily steals tasks, without waiting for  
     // the others or expecting individual tasks to have same runtimes. Analogous to:
     //
     //      #pragma omp parallel for schedule(dynamic, 1)
     //      for (int i = 0; i < 3; ++i) { ... }
-    pool.eager(3, [](std::size_t task_index) noexcept {
-        std::printf("Running eager task %zu of 1000\n", task_index + 1);
+    pool.for_each_dynamic(3, [](std::size_t task_index) noexcept {
+        std::printf("Running dynamic task %zu of 1000\n", task_index + 1);
     });
     return EXIT_SUCCESS;
 }
@@ -129,7 +129,7 @@ Most importantly, "Compare and Swap" (CAS) is a very expensive operation, and sh
 
 On x86, for example, the `LOCK ADD` [can easily take 50 CPU cycles](https://travisdowns.github.io/blog/2020/07/06/concurrency-costs), being 50x slower than a regular `ADD` instruction, but still easily 5-10x faster than a `LOCK CMPXCHG` instruction.
 Once the contention rises, the gap naturally widens, and is further amplified by the increased "failure" rate of the CAS operation, when the value being compared has already changed.
-That's why for the "eager" mode, we resort to using an additional atomic variable as opposed to more typical CAS-based implementations.
+That's why for the "dynamic" mode, we resort to using an additional atomic variable as opposed to more typical CAS-based implementations.
 
 ## Testing
 
