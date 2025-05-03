@@ -210,7 +210,15 @@ class fork_union {
         task_parts_remaining_.store(n, std::memory_order_seq_cst);
         task_generation_.fetch_add(1, std::memory_order_seq_cst); // ? Wake up sleepers
 
-        _worker_loop_for_eager_task(0); // Execute on the current thread
+        // Execute on the current thread
+        _worker_loop_for_eager_task(0);
+
+        // We may be in the in-flight position, where the current thread is already receiving
+        // tasks beyond the `task_parts_count_` index, but the worker threads are still executing
+        // tasks and haven't decremented the `task_parts_remaining_` variable yet.
+        while (task_parts_remaining_.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // Optional reset of the task variables for debuggability
         _reset_task();
     }
 
