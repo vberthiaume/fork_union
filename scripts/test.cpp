@@ -113,6 +113,39 @@ static bool test_oversubscribed_unbalanced_threads() noexcept {
            visited.back() == (expected_parts - 1);
 }
 
+struct c_function_context_t {
+    std::size_t *visited_ptr;
+    std::atomic<std::size_t> &counter;
+};
+
+extern "C" void _handle_one_task(av::fork_union_t::punned_task_context_t punned_context,
+                                 av::fork_union_t::task_t task) {
+    c_function_context_t const &context = *static_cast<c_function_context_t const *>(punned_context);
+    // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+    std::size_t const count_populated = context.counter.fetch_add(1, std::memory_order_relaxed);
+    context.visited_ptr[count_populated] = task.task_index;
+}
+
+/** @brief Make sure that all APIs work not only for lambda objects, but also function pointers. */
+static bool test_c_function_pointers() noexcept {
+
+    constexpr std::size_t expected_parts = 10'000'000;
+
+    av::fork_union_t pool;
+    auto const count_threads = std::thread::hardware_concurrency();
+    if (!pool.try_spawn(count_threads)) return false;
+    std::vector<std::size_t> visited(expected_parts, 0);
+    std::atomic<std::size_t> counter = 0;
+    c_function_context_t context {visited.data(), counter};
+    pool.for_each_dynamic(expected_parts, av::fork_union_t::c_callback_t {&_handle_one_task, &context});
+
+    // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
+    std::sort(visited.begin(), visited.end());
+    return counter.load() == expected_parts && std::adjacent_find(visited.begin(), visited.end()) == visited.end() &&
+           std::is_sorted(visited.begin(), visited.end()) && visited.front() == (0) &&
+           visited.back() == (expected_parts - 1);
+}
+
 int main() {
     test_t const tests[] = {
         {"`try_spawn` Success", test_try_spawn_success},                                       //
@@ -121,6 +154,7 @@ int main() {
         {"`for_each_static` Static Scheduling", test_for_each_static},                         //
         {"`for_each_dynamic` Dynamic Scheduling", test_for_each_dynamic},                      //
         {"`for_each_dynamic` Oversubscribed Threads", test_oversubscribed_unbalanced_threads}, //
+        {"`for_each_dynamic` with C Function Pointers", test_c_function_pointers},             //
     };
 
     std::size_t const total = sizeof(tests) / sizeof(tests[0]);

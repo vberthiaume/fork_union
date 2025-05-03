@@ -64,11 +64,13 @@ class fork_union {
     };
 
     using punned_task_context_t = void const *;
-    using trampoline_pointer_t = void (*)(punned_task_context_t, task_t const &);
+    using trampoline_pointer_t = void (*)(punned_task_context_t, task_t);
 
-    struct c_thread_callback_t {
+    struct c_callback_t {
         trampoline_pointer_t callable {nullptr};
         punned_task_context_t context {nullptr};
+
+        inline void operator()(task_t task) const noexcept { callable(context, task); }
     };
 
   private:
@@ -300,7 +302,7 @@ class fork_union {
      *  @param[in] thread_index The index of the thread that is executing this function.
      */
     template <typename function_type_>
-    static void _call_lambda_from_thread(void const *punned_lambda_pointer, task_t const &task) noexcept {
+    static void _call_lambda_from_thread(punned_task_context_t punned_lambda_pointer, task_t task) noexcept {
         auto const &lambda_object = *static_cast<function_type_ const *>(punned_lambda_pointer);
         lambda_object(task);
     }
