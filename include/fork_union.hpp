@@ -264,7 +264,7 @@ class fork_union {
             // Wait for either: a new ticket or a stop flag
             std::size_t new_task_generation;
             bool wants_to_stop;
-            while ((new_task_generation = task_generation_.load(std::memory_order_relaxed)) == last_task_generation &&
+            while ((new_task_generation = task_generation_.load(std::memory_order_acquire)) == last_task_generation &&
                    (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
                 std::this_thread::yield();
 
@@ -275,7 +275,7 @@ class fork_union {
             if (one_part_per_thread && task_parts_count_) {
                 task_trampoline_pointer_(task_lambda_pointer_, {thread_index, thread_index});
                 // ! The decrement must come after the task is executed
-                task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_relaxed);
+                task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
                 assert(before_decrement > 0 && "We can't be here if there are no worker threads");
             }
             else { _worker_loop_for_eager_task(thread_index); }
@@ -295,7 +295,7 @@ class fork_union {
             if (new_task_index >= task_parts_count_) break;
             task_trampoline_pointer_(task_lambda_pointer_, {thread_index, new_task_index});
             // ! The decrement must come after the task is executed
-            task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_relaxed);
+            task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
             assert(before_decrement > 0 && "We can't be here if there are no tasks left");
         }
     }
