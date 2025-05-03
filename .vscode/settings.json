@@ -76,6 +76,7 @@
         "iomanip": "cpp",
         "span": "cpp",
         "variant": "cpp",
-        "format": "cpp"
+        "format": "cpp",
+        "*.cmake.in": "cmake"
     }
 }
