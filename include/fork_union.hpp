@@ -224,7 +224,7 @@ class fork_union {
     void for_each_dynamic(task_index_t const n, function_type_ const &function) noexcept {
         // If there is just one thread, all work is done on the current thread
         if (total_threads_ == 1) {
-            for (task_index_t i = 0; i < n; ++i) function(i);
+            for (task_index_t i = 0; i < n; ++i) function(task_t {0, i});
             return;
         }
 
