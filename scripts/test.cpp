@@ -42,7 +42,7 @@ static bool test_for_each_thread() noexcept {
 
 /** @brief Make sure that `for_each` is called the right number of times with the right task IDs. */
 static bool test_for_each() noexcept {
-    std::size_t const expected_parts = 1'000'000;
+    std::size_t const expected_parts = 10'000'000;
     std::vector<std::size_t> visited(expected_parts, 0);
     std::atomic<std::size_t> counter = 0;
     {
@@ -68,7 +68,7 @@ static bool test_eager() noexcept {
     av::fork_union_t pool;
     auto const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_fork(count_threads)) return false;
-    std::size_t const expected_parts = 1'000'000;
+    std::size_t const expected_parts = 10'000'000;
     std::vector<std::size_t> visited(expected_parts, 0);
     std::atomic<std::size_t> counter = 0;
     pool.eager(expected_parts, [&](std::size_t const task_index) noexcept {

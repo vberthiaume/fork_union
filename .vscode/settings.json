@@ -69,6 +69,11 @@
         "__bit_reference": "cpp",
         "__hash_table": "cpp",
         "__split_buffer": "cpp",
-        "ios": "cpp"
+        "ios": "cpp",
+        "charconv": "cpp",
+        "iomanip": "cpp",
+        "span": "cpp",
+        "variant": "cpp",
+        "format": "cpp"
     }
 }

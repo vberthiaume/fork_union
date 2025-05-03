@@ -136,15 +136,15 @@ That's why for the "eager" mode, we resort to using an additional atomic variabl
 To run the tests, use CMake:
 
 ```bash
-cmake -B build_release
-cmake --build build_release --config Release     
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release
+cmake --build build_release --config Release
 build_release/scripts/fork_union_test
 ```
 
 For debug builds, consider using the VS Code debugger presets or the following commands:
 
 ```bash
-cmake -B build_debug -DCMAKE_BUILD_TYPE=Debug
+cmake -B build_debug -D CMAKE_BUILD_TYPE=Debug
 cmake --build build_debug --config Debug
 build_debug/scripts/fork_union_test
 ```

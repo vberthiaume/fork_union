@@ -77,11 +77,14 @@ class fork_union {
     alignas(std::max_align_t) std::atomic<std::size_t> task_generation_ {0};
 
   public:
-    fork_union(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
     fork_union(fork_union &&) = delete;
     fork_union(fork_union const &) = delete;
     fork_union &operator=(fork_union &&) = delete;
     fork_union &operator=(fork_union const &) = delete;
+
+    fork_union(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
+    ~fork_union() noexcept { stop_and_reset(); }
+    std::size_t thread_count() const noexcept { return total_threads_; }
 
     /**
      *  @brief Creates a thread-pool with the given number of threads.
@@ -120,7 +123,11 @@ class fork_union {
         return true;
     }
 
-    ~fork_union() noexcept {
+    /**
+     *  @brief Stops all threads and deallocates the thread-pool.
+     *  @note Can only be called from the main thread, and can't have any tasks in-flight.
+     */
+    void stop_and_reset() noexcept {
         if (total_threads_ == 0) return;                                    // ? Uninitialized
         if (total_threads_ == 1) return;                                    // ? No worker threads to join
         assert(task_parts_remaining_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
@@ -144,9 +151,14 @@ class fork_union {
     }
 
     /**
-     *  @brief  Executes a function in parallel on the current and all worker threads,
-     *          calling it @p (n) times, slicing the workloads size @p (n) into continuous
-     *          chunks allocated to each thread.
+     *  @brief Distributes @p (n) similar tasks into between threads.
+     *  @param[in] n The number of times to call the @p function.
+     *  @param[in] function The callback, receiving @b `task_t` or the task index as an argument.
+     *
+     *  Is designed for a "balanced" workload, where all threads have roughly the same amount of work.
+     *  @sa `eager` for a more dynamic workload.
+     *  The @p function is called @p (n) times, and each thread receives a slice of consecutive tasks.
+     *  @sa `for_each_range` if you prefer to receive workload slices over individual indices.
      */
     template <typename function_type_>
     void for_each(task_index_t const n, function_type_ const &function) noexcept {
@@ -157,9 +169,9 @@ class fork_union {
     }
 
     /**
-     *  @brief  Executes a function in parallel on the current and all worker threads,
-     *          calling it @b (k) times, slicing the workloads size @p (n) into continuous
-     *          @b (k) continuous chunks.
+     *  @brief Splits a range of @p (n) tasks into consecutive chunks for each thread.
+     *  @param[in] n The total length of the range to split between threads.
+     *  @param[in] function The callback, receiving @b `task_t` or an unsigned integer and the slice length.
      */
     template <typename function_type_>
     void for_each_range(task_index_t const n, function_type_ const &function) noexcept {
@@ -179,7 +191,7 @@ class fork_union {
 
     /**
      *  @brief Executes a function in parallel on the current and all worker threads.
-     *  @param[in] function The function to be executed, receiving the thread index as an argument.
+     *  @param[in] function The callback, receiving the thread index as an argument.
      */
     template <typename function_type_>
     void for_each_thread(function_type_ const &function) noexcept {
@@ -203,9 +215,10 @@ class fork_union {
     }
 
     /**
-     *  @brief Executes a function in parallel on the current and all worker threads,
-     *         calling it @p (n) times, in no particular order, stealing the workload
-     *         as soon as any more work is available.
+     *  @brief Executes uneven tasks on all threads, greedying for work.
+     *  @param[in] n The number of times to call the @p function.
+     *  @param[in] function The callback, receiving the `task_t` or the task index as an argument.
+     *  @sa `for_each` for a more "balanced" evenly-splittable workload.
      */
     template <typename function_type_>
     void eager(task_index_t const n, function_type_ const &function) noexcept {
