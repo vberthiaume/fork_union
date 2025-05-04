@@ -99,7 +99,7 @@ static bool test_oversubscribed_unbalanced_threads() noexcept {
     thread_local volatile std::size_t some_local_work = 0;
     pool.for_each_dynamic(expected_parts, [&](std::size_t const task_index) noexcept {
         // Perform some weird amount of work, that is not very different between consecutive tasks.
-        for (std::size_t i = 0; i != task_index % oversubscription; ++i) some_local_work += i * i;
+        for (std::size_t i = 0; i != task_index % oversubscription; ++i) some_local_work = some_local_work + i * i;
 
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
