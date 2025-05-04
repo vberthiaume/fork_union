@@ -15,10 +15,22 @@
  *  On C++17 and later we can detect misuse of lambdas that are not properly annotated.
  *  On C++20 and later we can use concepts for cleaner compile-time checks.
  */
-#define _FORK_UNION_DETECT_CPP_20 (__cplusplus >= 202002L)
-#define _FORK_UNION_DETECT_CPP_17 (__cplusplus >= 201703L)
-#if _FORK_UNION_DETECT_CPP_17
+#define _FU_DETECT_CPP_20 (__cplusplus >= 202002L)
+#define _FU_DETECT_CPP_17 (__cplusplus >= 201703L)
+#if _FU_DETECT_CPP_17
 #include <type_traits> // `std::is_nothrow_invocable_r`
+#endif
+
+#if _FU_DETECT_CPP_17
+#define _FU_MAYBE_UNUSED [[maybe_unused]]
+#else
+#if defined(__GNUC__) || defined(__clang__)
+#define _FU_MAYBE_UNUSED __attribute__((unused))
+#elif defined(_MSC_VER)
+#define _FU_MAYBE_UNUSED __pragma(warning(suppress : 4100))
+#else
+#define _FU_MAYBE_UNUSED
+#endif
 #endif
 
 namespace ashvardanian {
@@ -175,7 +187,7 @@ class fork_union {
     template <typename function_type_>
     void for_each_static(task_index_t const n, function_type_ const &function) noexcept {
 
-#if _FORK_UNION_DETECT_CPP_17
+#if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
         static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t>::value ||
                        std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value),
@@ -196,7 +208,7 @@ class fork_union {
     template <typename function_type_>
     void for_each_slice(task_index_t const n, function_type_ const &function) noexcept {
 
-#if _FORK_UNION_DETECT_CPP_17
+#if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
         static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t, task_index_t>::value ||
                        std::is_nothrow_invocable_r<void, function_type_, task_index_t, task_index_t>::value),
@@ -224,7 +236,7 @@ class fork_union {
     void for_each_thread(function_type_ const &function) noexcept {
         if (total_threads_ == 1) return function(0);
 
-#if _FORK_UNION_DETECT_CPP_17
+#if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
         static_assert(std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value,
                       "The callback must be invocable with a `task_index_t` argument");
@@ -256,7 +268,7 @@ class fork_union {
     template <typename function_type_>
     void for_each_dynamic(task_index_t const n, function_type_ const &function) noexcept {
 
-#if _FORK_UNION_DETECT_CPP_17
+#if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
         static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t>::value ||
                        std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value),
@@ -329,7 +341,8 @@ class fork_union {
             if (is_static && task_parts_count_) {
                 task_trampoline_pointer_(task_lambda_pointer_, {thread_index, thread_index});
                 // ! The decrement must come after the task is executed
-                task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
+                _FU_MAYBE_UNUSED task_index_t const before_decrement =
+                    task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
                 assert(before_decrement > 0 && "We can't be here if there are no worker threads");
             }
             else { _worker_loop_for_dynamic_tasks(thread_index); }
@@ -349,7 +362,8 @@ class fork_union {
             if (new_task_index >= task_parts_count_) break;
             task_trampoline_pointer_(task_lambda_pointer_, {thread_index, new_task_index});
             // ! The decrement must come after the task is executed
-            task_index_t const before_decrement = task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
+            _FU_MAYBE_UNUSED task_index_t const before_decrement =
+                task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
             assert(before_decrement > 0 && "We can't be here if there are no tasks left");
         }
     }
