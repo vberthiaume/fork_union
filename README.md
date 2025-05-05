@@ -152,7 +152,7 @@ To run the tests, use CMake:
 ```bash
 cmake -B build_release -D CMAKE_BUILD_TYPE=Release
 cmake --build build_release --config Release
-build_release/scripts/fork_union_test
+build_release/scripts/fork_union_test_cpp20
 ```
 
 For debug builds, consider using the VS Code debugger presets or the following commands:
@@ -160,5 +160,5 @@ For debug builds, consider using the VS Code debugger presets or the following c
 ```bash
 cmake -B build_debug -D CMAKE_BUILD_TYPE=Debug
 cmake --build build_debug --config Debug
-build_debug/scripts/fork_union_test
+build_debug/scripts/fork_union_test_cpp20
 ```

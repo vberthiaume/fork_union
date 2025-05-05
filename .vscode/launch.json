@@ -9,7 +9,7 @@
             "type": "cppdbg",
             "request": "launch",
             "preLaunchTask": "Build: Debug",
-            "program": "${workspaceFolder}/build_debug/scripts/fork_union_test",
+            "program": "${workspaceFolder}/build_debug/scripts/fork_union_test_cpp20",
             "cwd": "${workspaceFolder}",
             "args": [],
             "setupCommands": [
@@ -33,7 +33,7 @@
                 "MIMode": "lldb"
             },
             "windows": {
-                "program": "${workspaceFolder}\\build_debug\\scripts\\fork_union_test.exe",
+                "program": "${workspaceFolder}\\build_debug\\scripts\\fork_union_test_cpp20.exe",
                 "MIMode": "gdb",
                 "miDebuggerPath": "C:\\MinGw\\bin\\gdb.exe"
             }

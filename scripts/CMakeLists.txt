@@ -4,7 +4,7 @@ set(CXX_STANDARDS 11 14 17 20)
 
 foreach (STD IN LISTS CXX_STANDARDS)
     # Derive a unique target name
-    set(TGT fork_union_test_cxx${STD})
+    set(TGT fork_union_test_cpp${STD})
 
     # Create the executable
     add_executable(${TGT} ${TEST_SOURCES})
