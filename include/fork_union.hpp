@@ -217,13 +217,14 @@ class fork_union {
 
         // No need to slice the workload if we only have one thread
         assert(total_threads_ != 0 && "Thread pool not initialized");
-        if (total_threads_ == 1) return function(task_t {0, 0}, n);
+        if (total_threads_ == 1 || n == 1) return function(task_t {0, 0}, n);
+        if (n == 0) return;
 
         // Divide and round-up the workload size per thread
         task_index_t const n_per_thread = (n + total_threads_ - 1) / total_threads_;
         for_each_thread([n, n_per_thread, function](thread_index_t thread_index) noexcept {
-            task_index_t const begin = thread_index * n_per_thread;
-            task_index_t const count = std::min(n, begin + n_per_thread) - begin;
+            task_index_t const begin = (std::min)(thread_index * n_per_thread, n);
+            task_index_t const count = (std::min)(begin + n_per_thread, n) - begin;
             function(task_t {thread_index, begin}, count);
         });
     }
@@ -280,6 +281,10 @@ class fork_union {
             for (task_index_t i = 0; i < n; ++i) function(task_t {0, i});
             return;
         }
+
+        // No need to slice the work if there is just one task
+        if (n == 0) return;
+        if (n == 1) return function(task_t {0, 0});
 
         // Store closure address
         task_lambda_pointer_ = std::addressof(function);
