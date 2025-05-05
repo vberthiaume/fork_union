@@ -35,8 +35,26 @@ static bool test_for_each_thread() noexcept {
         if (!pool.try_spawn(count_threads)) return false;
         pool.for_each_thread([&](std::size_t const thread_index) noexcept { visited[thread_index] = 1; });
     }
-    for (size_t i = 0; i < count_threads; ++i)
+    for (std::size_t i = 0; i < count_threads; ++i)
         if (!visited[i]) return false;
+    return true;
+}
+
+/** @brief Make sure that `for_each_static` is called from each thread. */
+static bool test_uncomfortable_input_size() noexcept {
+    auto const count_threads = std::thread::hardware_concurrency();
+
+    av::fork_union_t pool;
+    if (!pool.try_spawn(count_threads)) return false;
+
+    for (std::size_t input_size = 0; input_size < count_threads; ++input_size) {
+        std::atomic<bool> out_of_bounds = false;
+        pool.for_each_static(input_size, [&](std::size_t const task_index) noexcept {
+            if (task_index >= count_threads) out_of_bounds.store(true, std::memory_order_relaxed);
+        });
+        if (out_of_bounds.load(std::memory_order_relaxed)) return false;
+    }
+
     return true;
 }
 
@@ -148,13 +166,14 @@ static bool test_c_function_pointers() noexcept {
 
 int main() {
     test_t const tests[] = {
-        {"`try_spawn` Success", test_try_spawn_success},                                       //
-        {"`try_spawn` Zero", test_try_spawn_zero},                                             //
-        {"`for_each_thread` Dispatch", test_for_each_thread},                                  //
-        {"`for_each_static` Static Scheduling", test_for_each_static},                         //
-        {"`for_each_dynamic` Dynamic Scheduling", test_for_each_dynamic},                      //
-        {"`for_each_dynamic` Oversubscribed Threads", test_oversubscribed_unbalanced_threads}, //
-        {"`for_each_dynamic` with C Function Pointers", test_c_function_pointers},             //
+        {"`try_spawn` normal", test_try_spawn_success},                                        //
+        {"`try_spawn` zero threads", test_try_spawn_zero},                                     //
+        {"`for_each_thread` dispatch", test_for_each_thread},                                  //
+        {"`for_each_static` for uncomfortable input size", test_uncomfortable_input_size},     //
+        {"`for_each_static` static scheduling", test_for_each_static},                         //
+        {"`for_each_dynamic` dynamic scheduling", test_for_each_dynamic},                      //
+        {"`for_each_dynamic` oversubscribed threads", test_oversubscribed_unbalanced_threads}, //
+        {"`for_each_dynamic` with C function pointers", test_c_function_pointers},             //
     };
 
     std::size_t const total = sizeof(tests) / sizeof(tests[0]);
