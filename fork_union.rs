@@ -1,7 +1,7 @@
 #![feature(allocator_api)]
 use std::alloc::{Allocator, Global};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -14,36 +14,64 @@ pub struct Task {
 
 type Trampoline = unsafe fn(*const (), Task);
 
+/// Rust doesn't allow over-aligning struct members, so we pack them into `Padded<T>`
+/// to ensure that high-contention atomics are placed on separate cache lines.
 #[repr(align(64))]
-struct Inner {
-    stop: AtomicBool,
-    task_context: AtomicPtr<()>,
-    task_trampoline: AtomicUsize,
-    task_parts_count: AtomicUsize,
-    task_parts_remaining: AtomicUsize,
-    task_parts_passed: AtomicUsize,
-    task_generation: AtomicUsize,
-    total_threads: usize,
+struct Padded<T>(T);
+
+impl<T> Padded<T> {
+    #[inline(always)]
+    const fn new(val: T) -> Self {
+        Self(val)
+    }
+    #[inline(always)]
+    fn get(&self) -> &T {
+        &self.0
+    }
+    #[inline(always)]
+    unsafe fn get_mut(&self) -> &mut T {
+        &mut *(&self.0 as *const _ as *mut T)
+    }
 }
 
+/// The shared state of the thread pool, used by all threads.
+/// It intentionally pads all of independently mutable regions to avoid false sharing.
+/// The `task_trampoline` function receives the `task_context` state pointers and
+/// some ethereal `Task` index similar to C-style thread pools.
+#[repr(align(64))]
+struct Inner {
+    pub total_threads: usize,
+    pub task_context: std::ptr,
+    pub task_trampoline: Trampoline,
+    pub task_parts_count: usize,
+
+    pub stop: Padded<AtomicBool>,
+    pub task_parts_remaining: Padded<AtomicUsize>,
+    pub task_parts_passed: Padded<AtomicUsize>,
+    pub task_generation: Padded<AtomicUsize>,
+}
+
+unsafe impl Sync for Inner {}
+
 impl Inner {
-    fn new(total_threads: usize) -> Self {
+    pub fn new(threads: usize) -> Self {
         Self {
-            stop: AtomicBool::new(false),
-            task_context: AtomicPtr::new(ptr::null_mut()),
-            task_trampoline: AtomicUsize::new(0),
-            task_parts_count: AtomicUsize::new(0),
-            task_parts_remaining: AtomicUsize::new(0),
-            task_parts_passed: AtomicUsize::new(0),
-            task_generation: AtomicUsize::new(0),
-            total_threads,
+            stop: Padded::new(AtomicBool::new(false)),
+            total_threads: threads,
+            task_context: ptr::null(),
+            task_trampoline: ptr::null(),
+            task_parts_count: 0,
+
+            task_parts_remaining: Padded::new(AtomicUsize::new(0)),
+            task_parts_passed: Padded::new(AtomicUsize::new(0)),
+            task_generation: Padded::new(AtomicUsize::new(0)),
         }
     }
 
     fn reset_task(&self) {
-        self.task_parts_count.store(0, Ordering::Relaxed);
-        self.task_context.store(ptr::null_mut(), Ordering::Relaxed);
-        self.task_trampoline.store(0, Ordering::Relaxed);
+        self.task_parts_count = 0;
+        self.task_context = ptr::null_mut();
+        self.task_trampoline = ptr::null_mut();
     }
 
     fn trampoline(&self) -> Trampoline {
@@ -55,9 +83,43 @@ impl Inner {
     }
 }
 
-/// Minimalistic non-resizable thread-pool.
+/// Minimalistic, fixed‑size thread‑pool for blocking scoped parallelism.
+///
+/// - You create the pool once with **N** logical threads (`try_spawn[_in]`).
+/// - You submit a *single* blocking kernel (`for_each_*`) that might touch millions of tasks.
+/// - The pool is torn down (or reused for the next kernel) when the call returns.
+///
+/// The current thread **participates** in the work, so for `N`‑way parallelism the
+/// implementation actually spawns **N − 1** background workers and runs the last
+/// slice on the caller thread. Thread count is *runtime constant* – there is no grow/shrink API.
+///
+/// ### Why another pool?
+///
+/// - Zero external deps – built only on `std::thread` and `std::sync::atomic`;
+///   no channels, no `Mutex`, no `Condvar`, no `async`, no `crossbeam`, no allocation per task.
+/// - Weak memory model – atomics use *acquire‑release* or even *relaxed* orderings
+///   where safe, better matching Arm / PowerPC memory semantics.
+/// - Friendly to custom allocators – the backing storage for the workers
+///   vector can have a runtime-defined size and use any memory allocator.
+///
+/// ### Task‑dispatch flavours
+///
+/// | Method             | Scheduling          | Suitable for        |
+/// |--------------------|---------------------|---------------------|
+/// | `for_each_thread`  | one call per worker | thread‑local state  |
+/// | `for_each_static`  | static slices       | evenly sized tasks  |
+/// | `for_each_dynamic` | work‑stealing       | unpredictable tasks |
+///
+/// ```no_run
+/// use fork_union::ForkUnion;
+/// let pool = ForkUnion::try_spawn(4).expect("spawn");
+/// pool.for_each_static(1_000_000, |i| {
+///     heavy_math(i);
+/// });
+/// ```
+///
 pub struct ForkUnion<A: Allocator + Clone = Global> {
-    inner: Arc<Inner>,
+    inner: &Inner,
     workers: Vec<JoinHandle<()>, A>,
 }
 
@@ -68,7 +130,7 @@ impl<A: Allocator + Clone> ForkUnion<A> {
             return None;
         }
         if planned_threads == 1 {
-            let inner = Arc::new(Inner::new(1));
+            let inner = Inner::new(1);
             return Some(Self {
                 inner,
                 workers: Vec::new_in(alloc),
