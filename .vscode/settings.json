@@ -5,6 +5,7 @@
         "futex",
         "noexcept",
         "NUMA",
+        "println",
         "SIMT",
         "STREQUAL",
         "syscall",
