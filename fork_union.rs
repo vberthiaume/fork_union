@@ -1,6 +1,4 @@
-#![feature(allocator_api, try_reserve)]
-// Minimalistic thread-pool designed for SIMT-style 'Fork-Join' parallelism.
-// Ported from the C++ reference implementation.
+#![feature(allocator_api)]
 use std::alloc::{Allocator, Global};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
@@ -71,7 +69,10 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         }
         if planned_threads == 1 {
             let inner = Arc::new(Inner::new(1));
-            return Some(Self { inner, workers: Vec::new_in(alloc) });
+            return Some(Self {
+                inner,
+                workers: Vec::new_in(alloc),
+            });
         }
         let inner = Arc::new(Inner::new(planned_threads));
         let mut workers = Vec::try_with_capacity_in(planned_threads - 1, alloc.clone()).ok()?;
@@ -81,7 +82,6 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         }
         Some(Self { inner, workers })
     }
-
 
     /// Returns the number of threads in the pool.
     pub fn thread_count(&self) -> usize {
@@ -112,10 +112,18 @@ impl<A: Allocator + Clone> ForkUnion<A> {
             return;
         }
         let ctx = &function as *const F as *const ();
-        self.inner.task_context.store(ctx as *mut (), Ordering::Relaxed);
-        self.inner.task_trampoline.store(call_thread::<F> as usize, Ordering::Relaxed);
-        self.inner.task_parts_count.store(self.inner.total_threads, Ordering::Relaxed);
-        self.inner.task_parts_remaining.store(self.inner.total_threads - 1, Ordering::Relaxed);
+        self.inner
+            .task_context
+            .store(ctx as *mut (), Ordering::Relaxed);
+        self.inner
+            .task_trampoline
+            .store(call_thread::<F> as usize, Ordering::Relaxed);
+        self.inner
+            .task_parts_count
+            .store(self.inner.total_threads, Ordering::Relaxed);
+        self.inner
+            .task_parts_remaining
+            .store(self.inner.total_threads - 1, Ordering::Relaxed);
         self.inner.task_generation.fetch_add(1, Ordering::Release);
         function(0);
         while self.inner.task_parts_remaining.load(Ordering::Acquire) != 0 {
@@ -176,8 +184,12 @@ impl<A: Allocator + Clone> ForkUnion<A> {
             return;
         }
         let ctx = &function as *const F as *const ();
-        self.inner.task_context.store(ctx as *mut (), Ordering::Relaxed);
-        self.inner.task_trampoline.store(call_index::<F> as usize, Ordering::Relaxed);
+        self.inner
+            .task_context
+            .store(ctx as *mut (), Ordering::Relaxed);
+        self.inner
+            .task_trampoline
+            .store(call_index::<F> as usize, Ordering::Relaxed);
         self.inner.task_parts_count.store(n, Ordering::Relaxed);
         self.inner.task_parts_passed.store(0, Ordering::Relaxed);
         self.inner.task_parts_remaining.store(n, Ordering::Relaxed);
@@ -230,7 +242,15 @@ fn worker_loop(inner: Arc<Inner>, thread_index: usize) {
         if is_static && inner.task_parts_count.load(Ordering::Acquire) > 0 {
             let trampoline = inner.trampoline();
             let context = inner.context();
-            unsafe { trampoline(context, Task { thread_index, task_index: thread_index }); }
+            unsafe {
+                trampoline(
+                    context,
+                    Task {
+                        thread_index,
+                        task_index: thread_index,
+                    },
+                );
+            }
             inner.task_parts_remaining.fetch_sub(1, Ordering::AcqRel);
         } else {
             dynamic_loop(&inner, thread_index);
@@ -247,7 +267,15 @@ fn dynamic_loop(inner: &Arc<Inner>, thread_index: usize) {
         if idx >= inner.task_parts_count.load(Ordering::Acquire) {
             break;
         }
-        unsafe { trampoline(context, Task { thread_index, task_index: idx }); }
+        unsafe {
+            trampoline(
+                context,
+                Task {
+                    thread_index,
+                    task_index: idx,
+                },
+            );
+        }
         inner.task_parts_remaining.fetch_sub(1, Ordering::AcqRel);
     }
 }
