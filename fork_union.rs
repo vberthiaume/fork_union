@@ -284,6 +284,17 @@ fn dynamic_loop(inner: &Arc<Inner>, thread_index: usize) {
 mod tests {
     use super::*;
     use std::alloc::Global;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[inline]
+    fn hw_threads() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
 
     #[test]
     fn spawn_with_global() {
@@ -295,5 +306,176 @@ mod tests {
     fn spawn_with_allocator() {
         let pool: ForkUnion<Global> = ForkUnion::try_spawn_in(2, Global).expect("spawn");
         assert_eq!(pool.thread_count(), 2);
+    }
+
+    #[test]
+    fn try_spawn_success() {
+        let pool = ForkUnion::try_spawn(hw_threads());
+        assert!(pool.is_some());
+    }
+
+    #[test]
+    fn try_spawn_zero_threads() {
+        assert!(ForkUnion::try_spawn(0).is_none());
+    }
+
+    #[test]
+    fn for_each_thread_dispatch() {
+        let count_threads = hw_threads();
+        let pool = ForkUnion::try_spawn(count_threads).expect("spawn");
+
+        let visited = Arc::new(
+            (0..count_threads)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
+        let visited_ref = Arc::clone(&visited);
+
+        pool.for_each_thread(move |thread_index| {
+            visited_ref[thread_index].store(true, Ordering::Relaxed);
+        });
+
+        for flag in visited.iter() {
+            assert!(
+                flag.load(Ordering::Relaxed),
+                "thread {flag:?} never reached the callback"
+            );
+        }
+    }
+
+    #[test]
+    fn for_each_static_uncomfortable_input_size() {
+        let count_threads = hw_threads();
+        let pool = ForkUnion::try_spawn(count_threads).expect("spawn");
+
+        for input_size in 0..count_threads {
+            let out_of_bounds = AtomicBool::new(false);
+            pool.for_each_static(input_size, |task_index| {
+                if task_index >= count_threads {
+                    out_of_bounds.store(true, Ordering::Relaxed);
+                }
+            });
+            assert!(
+                !out_of_bounds.load(Ordering::Relaxed),
+                "task_index exceeded thread_count at n = {input_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_each_static_static_scheduling() {
+        const EXPECTED_PARTS: usize = 10_000_000;
+        let pool = ForkUnion::try_spawn(hw_threads()).expect("spawn");
+
+        let visited = Arc::new(
+            (0..EXPECTED_PARTS)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
+        let duplicate = AtomicBool::new(false);
+        let visited_ref = Arc::clone(&visited);
+
+        pool.for_each_static(EXPECTED_PARTS, move |task_index| {
+            if visited_ref[task_index].swap(true, Ordering::Relaxed) {
+                duplicate.store(true, Ordering::Relaxed);
+            }
+        });
+
+        assert!(
+            !duplicate.load(Ordering::Relaxed),
+            "static scheduling produced duplicate task IDs"
+        );
+        for flag in visited.iter() {
+            assert!(flag.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn for_each_dynamic_dynamic_scheduling() {
+        const EXPECTED_PARTS: usize = 10_000_000;
+        let pool = ForkUnion::try_spawn(hw_threads()).expect("spawn");
+
+        let visited = Arc::new(
+            (0..EXPECTED_PARTS)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
+        let duplicate = AtomicBool::new(false);
+        let visited_ref = Arc::clone(&visited);
+
+        pool.for_each_dynamic(EXPECTED_PARTS, move |task_index| {
+            if visited_ref[task_index].swap(true, Ordering::Relaxed) {
+                duplicate.store(true, Ordering::Relaxed);
+            }
+        });
+
+        assert!(
+            !duplicate.load(Ordering::Relaxed),
+            "dynamic scheduling produced duplicate task IDs"
+        );
+        for flag in visited.iter() {
+            assert!(flag.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn oversubscribed_unbalanced_threads() {
+        const EXPECTED_PARTS: usize = 10_000_000;
+        const OVERSUB: usize = 7;
+        let threads = hw_threads() * OVERSUB;
+        let pool = ForkUnion::try_spawn(threads).expect("spawn");
+
+        let visited = Arc::new(
+            (0..EXPECTED_PARTS)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
+        let duplicate = AtomicBool::new(false);
+        let visited_ref = Arc::clone(&visited);
+
+        thread_local! { static LOCAL_WORK: std::cell::Cell<usize> = std::cell::Cell::new(0); }
+
+        pool.for_each_dynamic(EXPECTED_PARTS, move |task_index| {
+            // Mildly unbalanced CPU burn, similar to the C++ variant
+            LOCAL_WORK.with(|cell| {
+                let mut acc = cell.get();
+                for i in 0..task_index % OVERSUB {
+                    acc = acc.wrapping_add(i * i);
+                }
+                cell.set(acc);
+            });
+
+            if visited_ref[task_index].swap(true, Ordering::Relaxed) {
+                duplicate.store(true, Ordering::Relaxed);
+            }
+        });
+
+        assert!(
+            !duplicate.load(Ordering::Relaxed),
+            "oversubscribed run produced duplicate task IDs"
+        );
+        for flag in visited.iter() {
+            assert!(flag.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn c_function_pointer_compatibility() {
+        static TASK_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        const EXPECTED_PARTS: usize = 10_000_000;
+
+        fn tally(_: usize) {
+            TASK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        }
+
+        TASK_COUNTER.store(0, Ordering::Relaxed);
+        let pool = ForkUnion::try_spawn(hw_threads()).expect("spawn");
+        pool.for_each_dynamic(EXPECTED_PARTS, tally as fn(usize));
+
+        assert_eq!(
+            TASK_COUNTER.load(Ordering::Relaxed),
+            EXPECTED_PARTS,
+            "function-pointer callback executed the wrong number of times"
+        );
     }
 }

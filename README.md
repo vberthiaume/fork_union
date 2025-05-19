@@ -211,5 +211,6 @@ build_debug/scripts/fork_union_test_cpp20
 For Rust, use the following command:
 
 ```bash
+rustup toolchain install nightly
 cargo +nightly test --release
 ```
