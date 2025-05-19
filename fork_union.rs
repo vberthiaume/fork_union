@@ -338,7 +338,7 @@ mod tests {
         for flag in visited.iter() {
             assert!(
                 flag.load(Ordering::Relaxed),
-                "thread {flag:?} never reached the callback"
+                "thread never reached the callback"
             );
         }
     }
@@ -372,12 +372,13 @@ mod tests {
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>(),
         );
-        let duplicate = AtomicBool::new(false);
+        let duplicate = Arc::new(AtomicBool::new(false));
         let visited_ref = Arc::clone(&visited);
+        let duplicate_ref = Arc::clone(&duplicate);
 
         pool.for_each_static(EXPECTED_PARTS, move |task_index| {
             if visited_ref[task_index].swap(true, Ordering::Relaxed) {
-                duplicate.store(true, Ordering::Relaxed);
+                duplicate_ref.store(true, Ordering::Relaxed);
             }
         });
 
@@ -400,12 +401,13 @@ mod tests {
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>(),
         );
-        let duplicate = AtomicBool::new(false);
+        let duplicate = Arc::new(AtomicBool::new(false));
         let visited_ref = Arc::clone(&visited);
+        let duplicate_ref = Arc::clone(&duplicate);
 
         pool.for_each_dynamic(EXPECTED_PARTS, move |task_index| {
             if visited_ref[task_index].swap(true, Ordering::Relaxed) {
-                duplicate.store(true, Ordering::Relaxed);
+                duplicate_ref.store(true, Ordering::Relaxed);
             }
         });
 
@@ -421,8 +423,8 @@ mod tests {
     #[test]
     fn oversubscribed_unbalanced_threads() {
         const EXPECTED_PARTS: usize = 10_000_000;
-        const OVERSUB: usize = 7;
-        let threads = hw_threads() * OVERSUB;
+        const OVERSUBSCRIPTION: usize = 7;
+        let threads = hw_threads() * OVERSUBSCRIPTION;
         let pool = ForkUnion::try_spawn(threads).expect("spawn");
 
         let visited = Arc::new(
@@ -430,23 +432,24 @@ mod tests {
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>(),
         );
-        let duplicate = AtomicBool::new(false);
+        let duplicate = Arc::new(AtomicBool::new(false));
         let visited_ref = Arc::clone(&visited);
+        let duplicate_ref = Arc::clone(&duplicate);
 
         thread_local! { static LOCAL_WORK: std::cell::Cell<usize> = std::cell::Cell::new(0); }
 
         pool.for_each_dynamic(EXPECTED_PARTS, move |task_index| {
-            // Mildly unbalanced CPU burn, similar to the C++ variant
+            // Mildly unbalanced CPU burn
             LOCAL_WORK.with(|cell| {
                 let mut acc = cell.get();
-                for i in 0..task_index % OVERSUB {
+                for i in 0..task_index % OVERSUBSCRIPTION {
                     acc = acc.wrapping_add(i * i);
                 }
                 cell.set(acc);
             });
 
             if visited_ref[task_index].swap(true, Ordering::Relaxed) {
-                duplicate.store(true, Ordering::Relaxed);
+                duplicate_ref.store(true, Ordering::Relaxed);
             }
         });
 
