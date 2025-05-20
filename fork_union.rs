@@ -1,5 +1,8 @@
 #![feature(allocator_api)]
 use std::alloc::{AllocError, Allocator, Global};
+use std::cell::UnsafeCell;
+use std::collections::TryReserveError;
+use std::io::Error as IoError;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -7,7 +10,8 @@ use std::thread::{self, JoinHandle};
 #[derive(Debug)]
 pub enum ForkUnionError {
     Alloc(AllocError),
-    Spawn(std::io::Error),
+    Reserve(TryReserveError),
+    Spawn(IoError),
 }
 
 /// Describes a portion of work executed on a specific thread.
@@ -19,29 +23,32 @@ pub struct Task {
 
 type Trampoline = unsafe fn(*const (), Task);
 
+/// Dummy trampoline function as opposed to the real `worker_loop`.
 unsafe fn dummy_trampoline(_ctx: *const (), _task: Task) {
     unreachable!("dummy_trampoline should not be called")
 }
 
-/// Rust doesn't allow over-aligning struct members, so we pack them into `Padded<T>`
+/// Rust doesn't allow over-aligning struct members, so we pack them into `Padded64<T>`
 /// to ensure that high-contention atomics are placed on separate cache lines.
 #[repr(align(64))]
-struct Padded<T>(T);
+struct Padded64<T>(UnsafeCell<T>);
 
-impl<T> Padded<T> {
+impl<T> Padded64<T> {
     #[inline(always)]
     const fn new(val: T) -> Self {
-        Self(val)
+        Self(UnsafeCell::new(val))
     }
     #[inline(always)]
     fn get(&self) -> &T {
-        &self.0
+        unsafe { &*self.0.get() }
     }
     #[inline(always)]
     unsafe fn get_mut(&self) -> &mut T {
         &mut *self.0.get()
     }
 }
+unsafe impl<T: Send> Send for Padded64<T> {}
+unsafe impl<T: Sync> Sync for Padded64<T> {}
 
 /// The shared state of the thread pool, used by all threads.
 /// It intentionally pads all of independently mutable regions to avoid false sharing.
@@ -54,10 +61,10 @@ struct Inner {
     pub task_trampoline: Trampoline,
     pub task_parts_count: usize,
 
-    pub stop: Padded<AtomicBool>,
-    pub task_parts_remaining: Padded<AtomicUsize>,
-    pub task_parts_passed: Padded<AtomicUsize>,
-    pub task_generation: Padded<AtomicUsize>,
+    pub stop: Padded64<AtomicBool>,
+    pub task_parts_remaining: Padded64<AtomicUsize>,
+    pub task_parts_passed: Padded64<AtomicUsize>,
+    pub task_generation: Padded64<AtomicUsize>,
 }
 
 unsafe impl Sync for Inner {}
@@ -66,15 +73,15 @@ unsafe impl Send for Inner {}
 impl Inner {
     pub fn new(threads: usize) -> Self {
         Self {
-            stop: Padded::new(AtomicBool::new(false)),
+            stop: Padded64::new(AtomicBool::new(false)),
             total_threads: threads,
             task_context: ptr::null(),
             task_trampoline: dummy_trampoline,
             task_parts_count: 0,
 
-            task_parts_remaining: Padded::new(AtomicUsize::new(0)),
-            task_parts_passed: Padded::new(AtomicUsize::new(0)),
-            task_generation: Padded::new(AtomicUsize::new(0)),
+            task_parts_remaining: Padded64::new(AtomicUsize::new(0)),
+            task_parts_passed: Padded64::new(AtomicUsize::new(0)),
+            task_generation: Padded64::new(AtomicUsize::new(0)),
         }
     }
 
@@ -123,11 +130,30 @@ impl Inner {
 /// | `for_each_static`  | static slices       | evenly sized tasks  |
 /// | `for_each_dynamic` | work‑stealing       | unpredictable tasks |
 ///
+/// ### Example
+///
+/// The simplest example of using the pool:
+///
 /// ```no_run
 /// use fork_union::ForkUnion;
-/// let pool = ForkUnion::spawn(4).expect("spawn");
-/// pool.for_each_static(1_000_000, |i| {
-///     heavy_math(i);
+///
+/// let pool = spawn(4); // ! Unsafe shortcut, see below
+/// pool.for_each_static(400, |i| {
+///     heavy_math(i); // Will be called 400 times, 100 per thread.
+/// });
+/// ```
+///
+/// The recommended way, however, is to use the safer `try_spawn_in` method,
+/// that won't panic from a failed `thread::Builder::name` call.
+///
+/// ```no_run
+/// use fork_union::ForkUnion;
+/// use std::thread;
+/// use std::alloc::Global;
+///
+/// let pool = ForkUnion::try_spawn_in(4, Global)?;
+/// pool.for_each_dynamic(400, |i| {
+///     heavy_math(i); // More expensive to synchronize, but better for uneven workloads.
 /// });
 /// ```
 ///
@@ -137,40 +163,37 @@ pub struct ForkUnion<A: Allocator + Clone = Global> {
 }
 
 impl<A: Allocator + Clone> ForkUnion<A> {
-    pub fn spawn(planned_threads: usize) -> Result<Self, ForkUnionError> {
-        Self::try_spawn_in(
-            &thread::Builder::new().name("ForkUnion".to_string()),
-            planned_threads,
-            A::clone(&Global),
-        )
-    }
-
     /// Creates the pool with the desired number of threads using a custom allocator.
-    pub fn try_spawn_in(
-        thread_builder: &thread::Builder,
-        planned_threads: usize,
-        alloc: A,
-    ) -> Result<Self, ForkUnionError> {
-        if planned_threads == 0 || planned_threads > A::max_size() {
-            return Err(AllocError);
+    pub fn try_spawn_in(planned_threads: usize, alloc: A) -> Result<Self, ForkUnionError> {
+        if planned_threads == 0 {
+            return Err(ForkUnionError::Spawn(IoError::new(
+                std::io::ErrorKind::InvalidInput,
+                "Thread count must be > 0",
+            )));
         }
         if planned_threads == 1 {
-            return Some(Self {
+            return Ok(Self {
                 inner: Box::new_in(Inner::new(1), alloc.clone()),
                 workers: Vec::new_in(alloc.clone()),
             });
         }
 
         // With the `inner` object allocated on the heap it we will be able to move the owning object around.
-        let inner = Box::try_new_in(Inner::new(planned_threads), alloc.clone())?;
-        let inner_ptr: *const Inner = inner.as_ref();
+        let inner = Box::try_new_in(Inner::new(planned_threads), alloc.clone())
+            .map_err(ForkUnionError::Alloc)?;
+        let inner_ptr: &'static Inner = unsafe { &*(inner.as_ref() as *const Inner) };
 
         let workers_cap = planned_threads.saturating_sub(1);
-        let mut workers = Vec::try_with_capacity_in(workers_cap, alloc.clone())?;
+        let mut workers = Vec::try_with_capacity_in(workers_cap, alloc.clone())
+            .map_err(ForkUnionError::Reserve)?;
         for i in 0..workers_cap {
-            let worker =
-                thread_builder.spawn(move || unsafe { worker_loop(&*inner_ptr, i + 1) })?;
-            workers.push(worker);
+            // We are using the `spawn_unchecked` as the thread may easily outlive the caller.
+            unsafe {
+                let worker = thread::Builder::new()
+                    .spawn_unchecked(move || worker_loop(&*inner_ptr, i + 1))
+                    .map_err(ForkUnionError::Spawn)?;
+                workers.push(worker);
+            }
         }
 
         Ok(Self { inner, workers })
@@ -324,13 +347,6 @@ impl<A: Allocator + Clone> Drop for ForkUnion<A> {
     }
 }
 
-impl ForkUnion<Global> {
-    /// Creates the pool with the desired number of threads using the global allocator.
-    pub fn try_spawn(planned_threads: usize) -> Option<Self> {
-        Self::try_spawn_in(planned_threads, Global)
-    }
-}
-
 unsafe fn call_thread<F: Fn(usize)>(ctx: *const (), task: Task) {
     let f = &*(ctx as *const F);
     f(task.thread_index);
@@ -405,6 +421,12 @@ fn dynamic_loop(inner: &'static Inner, thread_index: usize) {
     }
 }
 
+/// Spawns a pool with the default allocator.
+pub fn spawn(planned_threads: usize) -> ForkUnion<Global> {
+    ForkUnion::<Global>::try_spawn_in(planned_threads, Global::default())
+        .expect("Failed to spawn ForkUnion thread pool")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,21 +445,20 @@ mod tests {
 
     #[test]
     fn spawn_with_global() {
-        let pool = ForkUnion::spawn(2);
+        let pool = spawn(2);
         assert_eq!(pool.thread_count(), 2);
     }
 
     #[test]
     fn spawn_with_allocator() {
-        let builder = thread::Builder::new().name("ForkUnionTest".to_string());
-        let pool: ForkUnion<Global> = ForkUnion::try_spawn_in(&builder, 2, Global).expect("spawn");
+        let pool = ForkUnion::try_spawn_in(2, Global).expect("spawn");
         assert_eq!(pool.thread_count(), 2);
     }
 
     #[test]
     fn for_each_thread_dispatch() {
         let count_threads = hw_threads();
-        let pool = ForkUnion::spawn(count_threads);
+        let pool = spawn(count_threads);
 
         let visited = Arc::new(
             (0..count_threads)
@@ -461,7 +482,7 @@ mod tests {
     #[test]
     fn for_each_static_uncomfortable_input_size() {
         let count_threads = hw_threads();
-        let pool = ForkUnion::spawn(count_threads);
+        let pool = spawn(count_threads);
 
         for input_size in 0..count_threads {
             let out_of_bounds = AtomicBool::new(false);
@@ -480,7 +501,7 @@ mod tests {
     #[test]
     fn for_each_static_static_scheduling() {
         const EXPECTED_PARTS: usize = 10_000_000;
-        let pool = ForkUnion::spawn(hw_threads());
+        let pool = spawn(hw_threads());
 
         let visited = Arc::new(
             (0..EXPECTED_PARTS)
@@ -509,7 +530,7 @@ mod tests {
     #[test]
     fn for_each_dynamic_dynamic_scheduling() {
         const EXPECTED_PARTS: usize = 10_000_000;
-        let pool = ForkUnion::spawn(hw_threads());
+        let pool = spawn(hw_threads());
 
         let visited = Arc::new(
             (0..EXPECTED_PARTS)
@@ -540,7 +561,7 @@ mod tests {
         const EXPECTED_PARTS: usize = 10_000_000;
         const OVERSUBSCRIPTION: usize = 7;
         let threads = hw_threads() * OVERSUBSCRIPTION;
-        let pool = ForkUnion::spawn(threads);
+        let pool = spawn(threads);
 
         let visited = Arc::new(
             (0..EXPECTED_PARTS)
@@ -587,7 +608,7 @@ mod tests {
         }
 
         TASK_COUNTER.store(0, Ordering::Relaxed);
-        let pool = ForkUnion::spawn(hw_threads());
+        let pool = spawn(hw_threads());
         pool.for_each_dynamic(EXPECTED_PARTS, tally as fn(usize));
 
         assert_eq!(
