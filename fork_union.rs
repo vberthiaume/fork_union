@@ -400,6 +400,19 @@ impl<A: Allocator + Clone> Drop for ForkUnion<A> {
     }
 }
 
+impl<A> ForkUnion<A>
+where
+    A: Allocator + Clone + Default,
+{
+    pub fn try_spawn(planned_threads: usize) -> Result<Self, ForkUnionError> {
+        Self::try_named_spawn_in("ForkUnion", planned_threads, A::default())
+    }
+
+    pub fn try_named_spawn(name: &str, planned_threads: usize) -> Result<Self, ForkUnionError> {
+        Self::try_named_spawn_in(name, planned_threads, A::default())
+    }
+}
+
 unsafe fn call_thread<F: Fn(usize)>(ctx: *const (), task: Task) {
     let f = &*(ctx as *const F);
     f(task.thread_index);

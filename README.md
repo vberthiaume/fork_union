@@ -64,7 +64,10 @@ use fork_union::ForkUnion;
 fn heavy_math(_: usize) {}
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let pool = ForkUnion::try_spawn(4)?;
     let pool = ForkUnion::try_spawn_in(4, Global)?;
+    let pool = ForkUnion::try_named_spawn("heavy-math", 4)?;
+    let pool = ForkUnion::try_named_spawn_in("heavy-math", 4, Global)?;
     pool.for_each_dynamic(400, |i| {
         heavy_math(i);
     });
