@@ -169,9 +169,10 @@ class fork_union {
         // Deallocate the thread pool
         allocator_.deallocate(workers_, worker_threads);
 
-        // We don't have to reset the following variables, but it's a good practice
+        // Prepare for future spawns
         total_threads_ = 0;
         workers_ = nullptr;
+        stop_.store(false, std::memory_order_relaxed);
     }
 
     /**
