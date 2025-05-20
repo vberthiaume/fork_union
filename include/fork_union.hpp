@@ -11,6 +11,10 @@
 #include <cstddef> // `std::max_align_t`
 #include <cassert> // `assert`
 
+#define FORK_UNION_VERSION_MAJOR (0)
+#define FORK_UNION_VERSION_MINOR (1)
+#define FORK_UNION_VERSION_PATCH (1)
+
 /**
  *  On C++17 and later we can detect misuse of lambdas that are not properly annotated.
  *  On C++20 and later we can use concepts for cleaner compile-time checks.
