@@ -20,13 +20,22 @@ The __`fork_union`__ supports just 2 operation modes:
 - __"Dynamic"__ - work-stealing for uneven workloads.
 
 There is no nested parallelism, exception-handling, or "futures promises".
+Only 4 simple APIs:
+
+- `for_each_thread` - to dispatch a callback per thread.
+- `for_each_static` - for individual evenly-sized tasks.
+- `for_each_slice` - for slices of evenly-sized tasks.
+- `for_each_dynamic` - for individual unevenly-sized tasks.
+
+Both are available in C++ and Rust.
 
 ### Usage in Rust
 
+A minimal example may look like this:
+
 ```rs
-use fork_union::ForkUnion;
-let pool = ForkUnion::try_spawn(2).expect("spawn");
-assert_eq!(pool.thread_count(), 2);
+use fork_union::spawn;
+let pool = spawn(2);
 pool.for_each_thread(|thread_index| {
     println!("Hello from thread # {}", thread_index + 1);
 });
@@ -39,6 +48,28 @@ pool.for_each_slice(1000, |first_index, count| {
 pool.for_each_dynamic(1000, |task_index| {
     println!("Running dynamic task {} of 1000", task_index + 1);
 });
+
+```
+
+A safer `try_spawn_in` interface is recommended, using the Allocator API.
+A more realistic example may look like this:
+
+```rs
+#![feature(allocator_api)]
+use std::thread;
+use std::error::Error;
+use std::alloc::Global;
+use fork_union::ForkUnion;
+
+fn heavy_math(_: usize) {}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let pool = ForkUnion::try_spawn_in(4, Global)?;
+    pool.for_each_dynamic(400, |i| {
+        heavy_math(i);
+    });
+    Ok(())
+}
 ```
 
 ### Usage in C++
@@ -113,17 +144,20 @@ That's it.
 
 ## Why Not Use $𝑋$
 
-There are many other thread-pool implementations, that are more feature-rich, but have different limitations and design goals:
-
-Tokio
-Rayon
-Smol.rs
+There are many other thread-pool implementations, that are more feature-rich, but have different limitations and design goals.
+Both in C++:
 
 - [`taskflow/taskflow`](https://github.com/taskflow/taskflow) ![https://github.com/taskflow/taskflow](https://img.shields.io/github/stars/taskflow/taskflow)
 - [`progschj/ThreadPool`](https://github.com/progschj/ThreadPool) ![https://github.com/progschj/ThreadPool](https://img.shields.io/github/stars/progschj/ThreadPool)
 - [`bshoshany/thread-pool`](https://github.com/bshoshany/thread-pool) ![https://github.com/bshoshany/thread-pool](https://img.shields.io/github/stars/bshoshany/thread-pool)
 - [`vit-vit/CTPL`](https://github.com/vit-vit/CTPL) ![https://github.com/vit-vit/CTPL](https://img.shields.io/github/stars/vit-vit/CTPL)
 - [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool) ![https://github.com/mtrebi/thread-pool](https://img.shields.io/github/stars/mtrebi/thread-pool)
+
+... and in Rust:
+
+- [`tokio-rs/tokio`](https://github.com/tokio-rs/tokio) ![https://github.com/tokio-rs/tokio](https://img.shields.io/github/stars/tokio-rs/tokio)
+- [`rayon-rs/rayon`](https://github.com/rayon-rs/rayon) ![https://github.com/rayon-rs/rayon](https://img.shields.io/github/stars/rayon-rs/rayon)
+- [`smol-rs/smol`](https://github.com/smol-rs/smol) ![https://github.com/smol-rs/smol](https://img.shields.io/github/stars/smol-rs/smol)
 
 Those are not designed for the same OpenMP-like use-cases as __`fork_union`__.
 Instead, they primarily focus on task queueing, which requires a lot more work.
