@@ -1,4 +1,5 @@
 #![feature(allocator_api)]
+use core::fmt::Write as _;
 use std::alloc::{AllocError, Allocator, Global};
 use std::cell::UnsafeCell;
 use std::collections::TryReserveError;
@@ -197,7 +198,11 @@ pub struct ForkUnion<A: Allocator + Clone = Global> {
 
 impl<A: Allocator + Clone> ForkUnion<A> {
     /// Creates the pool with the desired number of threads using a custom allocator.
-    pub fn try_spawn_in(planned_threads: usize, alloc: A) -> Result<Self, ForkUnionError> {
+    pub fn try_named_spawn_in(
+        name: &str,
+        planned_threads: usize,
+        alloc: A,
+    ) -> Result<Self, ForkUnionError> {
         if planned_threads == 0 {
             return Err(ForkUnionError::Spawn(IoError::new(
                 std::io::ErrorKind::InvalidInput,
@@ -220,9 +225,19 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         let mut workers = Vec::try_with_capacity_in(workers_cap, alloc.clone())
             .map_err(ForkUnionError::Reserve)?;
         for i in 0..workers_cap {
+            // We need to carefully fill the workers name
+            let mut worker_name = String::new();
+            worker_name
+                .try_reserve_exact(name.len() + 3)
+                .map_err(ForkUnionError::Reserve)?;
+            worker_name.push_str(name);
+            write!(&mut worker_name, "{:03}", i + 1)
+                .expect("writing into a reserved String never fails");
+
             // We are using the `spawn_unchecked` as the thread may easily outlive the caller.
             unsafe {
                 let worker = thread::Builder::new()
+                    .name(worker_name)
                     .spawn_unchecked(move || worker_loop(&*inner_ptr, i + 1))
                     .map_err(ForkUnionError::Spawn)?;
                 workers.push(worker);
@@ -230,6 +245,11 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         }
 
         Ok(Self { inner, workers })
+    }
+
+    /// Creates the pool with the desired number of threads using a custom allocator.
+    pub fn try_spawn_in(planned_threads: usize, alloc: A) -> Result<Self, ForkUnionError> {
+        Self::try_named_spawn_in("ForkUnion", planned_threads, alloc)
     }
 
     /// Returns the number of threads in the pool.
