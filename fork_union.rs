@@ -463,7 +463,7 @@ pub fn spawn(planned_threads: usize) -> ForkUnion<Global> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::alloc::Global;
+    use std::alloc::{Global, Layout};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -714,5 +714,137 @@ mod tests {
         assert_eq!(COUNTER.load(Ordering::Relaxed), 1000);
         pool.stop_and_reset();
         pool.stop_and_reset();
+    }
+
+    #[derive(Clone)]
+    struct CountingAllocator {
+        used: Arc<AtomicUsize>,
+        limit: Option<usize>,
+    }
+
+    impl CountingAllocator {
+        fn new(limit: Option<usize>) -> Self {
+            Self {
+                used: Arc::new(AtomicUsize::new(0)),
+                limit,
+            }
+        }
+    }
+
+    unsafe impl Allocator for CountingAllocator {
+        fn allocate(&self, layout: Layout) -> Result<std::ptr::NonNull<[u8]>, AllocError> {
+            if let Some(limit) = self.limit {
+                let new = self.used.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+                if new > limit {
+                    self.used.fetch_sub(layout.size(), Ordering::SeqCst);
+                    return Err(AllocError);
+                }
+            }
+            Global.allocate(layout)
+        }
+
+        fn allocate_zeroed(&self, layout: Layout) -> Result<std::ptr::NonNull<[u8]>, AllocError> {
+            if let Some(limit) = self.limit {
+                let new = self.used.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+                if new > limit {
+                    self.used.fetch_sub(layout.size(), Ordering::SeqCst);
+                    return Err(AllocError);
+                }
+            }
+            Global.allocate_zeroed(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
+            if self.limit.is_some() {
+                self.used.fetch_sub(layout.size(), Ordering::SeqCst);
+            }
+            Global.deallocate(ptr, layout)
+        }
+
+        unsafe fn grow(
+            &self,
+            ptr: std::ptr::NonNull<u8>,
+            old: Layout,
+            new: Layout,
+        ) -> Result<std::ptr::NonNull<[u8]>, AllocError> {
+            if let Some(limit) = self.limit {
+                let extra = new.size().saturating_sub(old.size());
+                let new_used = self.used.fetch_add(extra, Ordering::SeqCst) + extra;
+                if new_used > limit {
+                    self.used.fetch_sub(extra, Ordering::SeqCst);
+                    return Err(AllocError);
+                }
+            }
+            Global.grow(ptr, old, new)
+        }
+
+        unsafe fn grow_zeroed(
+            &self,
+            ptr: std::ptr::NonNull<u8>,
+            old: Layout,
+            new: Layout,
+        ) -> Result<std::ptr::NonNull<[u8]>, AllocError> {
+            if let Some(limit) = self.limit {
+                let extra = new.size().saturating_sub(old.size());
+                let new_used = self.used.fetch_add(extra, Ordering::SeqCst) + extra;
+                if new_used > limit {
+                    self.used.fetch_sub(extra, Ordering::SeqCst);
+                    return Err(AllocError);
+                }
+            }
+            Global.grow_zeroed(ptr, old, new)
+        }
+
+        unsafe fn shrink(
+            &self,
+            ptr: std::ptr::NonNull<u8>,
+            old: Layout,
+            new: Layout,
+        ) -> Result<std::ptr::NonNull<[u8]>, AllocError> {
+            if self.limit.is_some() {
+                let delta = old.size().saturating_sub(new.size());
+                self.used.fetch_sub(delta, Ordering::SeqCst);
+            }
+            Global.shrink(ptr, old, new)
+        }
+    }
+
+    #[test]
+    fn for_each_dynamic_dynamic_scheduling_with_counting_alloc() {
+        const EXPECTED_PARTS: usize = 10_000_000;
+        const MINIMAL_NEEDED_SIZE: usize = size_of::<Inner>();
+
+        let small_allocator = CountingAllocator::new(Some(MINIMAL_NEEDED_SIZE - 1));
+        assert!(
+            ForkUnion::try_spawn_in(hw_threads(), small_allocator.clone()).is_err(),
+            "We should not be able to spawn a pool with a small allocator"
+        );
+
+        let large_allocator = CountingAllocator::new(Some(1024 * 1024));
+        let pool = ForkUnion::try_spawn_in(hw_threads(), large_allocator.clone())
+            .expect("We should have enough memory for this!");
+
+        let visited = Arc::new(
+            (0..EXPECTED_PARTS)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
+        let duplicate = Arc::new(AtomicBool::new(false));
+        let visited_ref = Arc::clone(&visited);
+        let duplicate_ref = Arc::clone(&duplicate);
+
+        pool.for_each_dynamic(EXPECTED_PARTS, move |task_index| {
+            if visited_ref[task_index].swap(true, Ordering::Relaxed) {
+                duplicate_ref.store(true, Ordering::Relaxed);
+            }
+        });
+
+        assert!(
+            !duplicate.load(Ordering::Relaxed),
+            "dynamic scheduling produced duplicate task IDs"
+        );
+        for flag in visited.iter() {
+            assert!(flag.load(Ordering::Relaxed));
+        }
     }
 }
