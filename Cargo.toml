@@ -1,9 +1,11 @@
 [package]
 name = "fork_union"
-version = "0.2.0"
+description = "Minimalistic scoped thread-pool designed for SIMT-style 'Fork-Join' parallelism"
+version = "0.1.1"
 edition = "2021"
 authors = ["Ash Vardanian"]
 license = "Apache-2.0"
+repository = "https://github.com/ashvardanian/fork_union"
 
 [lib]
 path = "fork_union.rs"
