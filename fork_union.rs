@@ -1,9 +1,14 @@
 #![feature(allocator_api)]
-use std::alloc::{Allocator, Global};
+use std::alloc::{AllocError, Allocator, Global};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+
+#[derive(Debug)]
+pub enum ForkUnionError {
+    Alloc(AllocError),
+    Spawn(std::io::Error),
+}
 
 /// Describes a portion of work executed on a specific thread.
 #[derive(Copy, Clone)]
@@ -13,6 +18,10 @@ pub struct Task {
 }
 
 type Trampoline = unsafe fn(*const (), Task);
+
+unsafe fn dummy_trampoline(_ctx: *const (), _task: Task) {
+    unreachable!("dummy_trampoline should not be called")
+}
 
 /// Rust doesn't allow over-aligning struct members, so we pack them into `Padded<T>`
 /// to ensure that high-contention atomics are placed on separate cache lines.
@@ -30,7 +39,7 @@ impl<T> Padded<T> {
     }
     #[inline(always)]
     unsafe fn get_mut(&self) -> &mut T {
-        &mut *(&self.0 as *const _ as *mut T)
+        &mut *self.0.get()
     }
 }
 
@@ -41,7 +50,7 @@ impl<T> Padded<T> {
 #[repr(align(64))]
 struct Inner {
     pub total_threads: usize,
-    pub task_context: std::ptr,
+    pub task_context: *const (),
     pub task_trampoline: Trampoline,
     pub task_parts_count: usize,
 
@@ -52,6 +61,7 @@ struct Inner {
 }
 
 unsafe impl Sync for Inner {}
+unsafe impl Send for Inner {}
 
 impl Inner {
     pub fn new(threads: usize) -> Self {
@@ -59,7 +69,7 @@ impl Inner {
             stop: Padded::new(AtomicBool::new(false)),
             total_threads: threads,
             task_context: ptr::null(),
-            task_trampoline: ptr::null(),
+            task_trampoline: dummy_trampoline,
             task_parts_count: 0,
 
             task_parts_remaining: Padded::new(AtomicUsize::new(0)),
@@ -69,17 +79,20 @@ impl Inner {
     }
 
     fn reset_task(&self) {
-        self.task_parts_count = 0;
-        self.task_context = ptr::null_mut();
-        self.task_trampoline = ptr::null_mut();
+        unsafe {
+            let mutable_self = self as *const Self as *mut Self;
+            (*mutable_self).task_parts_count = 0;
+            (*mutable_self).task_context = ptr::null();
+            (*mutable_self).task_trampoline = dummy_trampoline;
+        }
     }
 
     fn trampoline(&self) -> Trampoline {
-        unsafe { std::mem::transmute(self.task_trampoline.load(Ordering::Acquire)) }
+        self.task_trampoline
     }
 
     fn context(&self) -> *const () {
-        self.task_context.load(Ordering::Acquire)
+        self.task_context
     }
 }
 
@@ -112,37 +125,55 @@ impl Inner {
 ///
 /// ```no_run
 /// use fork_union::ForkUnion;
-/// let pool = ForkUnion::try_spawn(4).expect("spawn");
+/// let pool = ForkUnion::spawn(4).expect("spawn");
 /// pool.for_each_static(1_000_000, |i| {
 ///     heavy_math(i);
 /// });
 /// ```
 ///
 pub struct ForkUnion<A: Allocator + Clone = Global> {
-    inner: &Inner,
+    inner: Box<Inner, A>,
     workers: Vec<JoinHandle<()>, A>,
 }
 
 impl<A: Allocator + Clone> ForkUnion<A> {
+    pub fn spawn(planned_threads: usize) -> Result<Self, ForkUnionError> {
+        Self::try_spawn_in(
+            &thread::Builder::new().name("ForkUnion".to_string()),
+            planned_threads,
+            A::clone(&Global),
+        )
+    }
+
     /// Creates the pool with the desired number of threads using a custom allocator.
-    pub fn try_spawn_in(planned_threads: usize, alloc: A) -> Option<Self> {
-        if planned_threads == 0 {
-            return None;
+    pub fn try_spawn_in(
+        thread_builder: &thread::Builder,
+        planned_threads: usize,
+        alloc: A,
+    ) -> Result<Self, ForkUnionError> {
+        if planned_threads == 0 || planned_threads > A::max_size() {
+            return Err(AllocError);
         }
         if planned_threads == 1 {
-            let inner = Inner::new(1);
             return Some(Self {
-                inner,
-                workers: Vec::new_in(alloc),
+                inner: Box::new_in(Inner::new(1), alloc.clone()),
+                workers: Vec::new_in(alloc.clone()),
             });
         }
-        let inner = Arc::new(Inner::new(planned_threads));
-        let mut workers = Vec::try_with_capacity_in(planned_threads - 1, alloc.clone()).ok()?;
-        for i in 0..planned_threads - 1 {
-            let inner_cloned = Arc::clone(&inner);
-            workers.push(thread::spawn(move || worker_loop(inner_cloned, i + 1)));
+
+        // With the `inner` object allocated on the heap it we will be able to move the owning object around.
+        let inner = Box::try_new_in(Inner::new(planned_threads), alloc.clone())?;
+        let inner_ptr: *const Inner = inner.as_ref();
+
+        let workers_cap = planned_threads.saturating_sub(1);
+        let mut workers = Vec::try_with_capacity_in(workers_cap, alloc.clone())?;
+        for i in 0..workers_cap {
+            let worker =
+                thread_builder.spawn(move || unsafe { worker_loop(&*inner_ptr, i + 1) })?;
+            workers.push(worker);
         }
-        Some(Self { inner, workers })
+
+        Ok(Self { inner, workers })
     }
 
     /// Returns the number of threads in the pool.
@@ -155,13 +186,13 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         if self.inner.total_threads <= 1 {
             return;
         }
-        assert!(self.inner.task_parts_remaining.load(Ordering::SeqCst) == 0);
+        assert!(self.inner.task_parts_remaining.get().load(Ordering::SeqCst) == 0);
         self.inner.reset_task();
-        self.inner.stop.store(true, Ordering::Release);
+        self.inner.stop.get().store(true, Ordering::Release);
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
-        self.inner.stop.store(false, Ordering::Relaxed);
+        self.inner.stop.get().store(false, Ordering::Relaxed);
     }
 
     /// Executes a function on each thread of the pool.
@@ -174,21 +205,28 @@ impl<A: Allocator + Clone> ForkUnion<A> {
             return;
         }
         let ctx = &function as *const F as *const ();
-        self.inner
-            .task_context
-            .store(ctx as *mut (), Ordering::Relaxed);
-        self.inner
-            .task_trampoline
-            .store(call_thread::<F> as usize, Ordering::Relaxed);
-        self.inner
-            .task_parts_count
-            .store(self.inner.total_threads, Ordering::Relaxed);
+        unsafe {
+            let inner_ptr = self.inner.as_ref() as *const Inner as *mut Inner;
+            (*inner_ptr).task_context = ctx;
+            (*inner_ptr).task_trampoline = call_thread::<F>;
+            (*inner_ptr).task_parts_count = self.inner.total_threads;
+        }
         self.inner
             .task_parts_remaining
+            .get()
             .store(self.inner.total_threads - 1, Ordering::Relaxed);
-        self.inner.task_generation.fetch_add(1, Ordering::Release);
+        self.inner
+            .task_generation
+            .get()
+            .fetch_add(1, Ordering::Release);
         function(0);
-        while self.inner.task_parts_remaining.load(Ordering::Acquire) != 0 {
+        while self
+            .inner
+            .task_parts_remaining
+            .get()
+            .load(Ordering::Acquire)
+            != 0
+        {
             thread::yield_now();
         }
         self.inner.reset_task();
@@ -246,18 +284,34 @@ impl<A: Allocator + Clone> ForkUnion<A> {
             return;
         }
         let ctx = &function as *const F as *const ();
+        unsafe {
+            let inner_ptr = self.inner.as_ref() as *const Inner as *mut Inner;
+            (*inner_ptr).task_context = ctx;
+            (*inner_ptr).task_trampoline = call_index::<F>;
+            (*inner_ptr).task_parts_count = n;
+        }
         self.inner
-            .task_context
-            .store(ctx as *mut (), Ordering::Relaxed);
+            .task_parts_passed
+            .get()
+            .store(0, Ordering::Relaxed);
         self.inner
-            .task_trampoline
-            .store(call_index::<F> as usize, Ordering::Relaxed);
-        self.inner.task_parts_count.store(n, Ordering::Relaxed);
-        self.inner.task_parts_passed.store(0, Ordering::Relaxed);
-        self.inner.task_parts_remaining.store(n, Ordering::Relaxed);
-        self.inner.task_generation.fetch_add(1, Ordering::Release);
-        dynamic_loop(&self.inner, 0);
-        while self.inner.task_parts_remaining.load(Ordering::Acquire) != 0 {
+            .task_parts_remaining
+            .get()
+            .store(n, Ordering::Relaxed);
+        self.inner
+            .task_generation
+            .get()
+            .fetch_add(1, Ordering::Release);
+        // SAFETY: `self.inner` lives as long as the pool
+        let inner_ref: &'static Inner = unsafe { &*(self.inner.as_ref() as *const Inner) };
+        dynamic_loop(inner_ref, 0);
+        while self
+            .inner
+            .task_parts_remaining
+            .get()
+            .load(Ordering::Acquire)
+            != 0
+        {
             thread::yield_now();
         }
         self.inner.reset_task();
@@ -287,21 +341,21 @@ unsafe fn call_index<F: Fn(usize)>(ctx: *const (), task: Task) {
     f(task.task_index);
 }
 
-fn worker_loop(inner: Arc<Inner>, thread_index: usize) {
+fn worker_loop(inner: &'static Inner, thread_index: usize) {
     let mut last_generation = 0usize;
     loop {
         let mut new_generation;
         while {
-            new_generation = inner.task_generation.load(Ordering::Acquire);
-            new_generation == last_generation && !inner.stop.load(Ordering::Acquire)
+            new_generation = inner.task_generation.get().load(Ordering::Acquire);
+            new_generation == last_generation && !inner.stop.get().load(Ordering::Acquire)
         } {
             thread::yield_now();
         }
-        if inner.stop.load(Ordering::Acquire) {
+        if inner.stop.get().load(Ordering::Acquire) {
             return;
         }
-        let is_static = inner.task_parts_count.load(Ordering::Acquire) == inner.total_threads;
-        if is_static && inner.task_parts_count.load(Ordering::Acquire) > 0 {
+        let is_static = inner.task_parts_count == inner.total_threads;
+        if is_static && inner.task_parts_count > 0 {
             let trampoline = inner.trampoline();
             let context = inner.context();
             unsafe {
@@ -313,20 +367,26 @@ fn worker_loop(inner: Arc<Inner>, thread_index: usize) {
                     },
                 );
             }
-            inner.task_parts_remaining.fetch_sub(1, Ordering::AcqRel);
+            inner
+                .task_parts_remaining
+                .get()
+                .fetch_sub(1, Ordering::AcqRel);
         } else {
-            dynamic_loop(&inner, thread_index);
+            dynamic_loop(inner, thread_index);
         }
         last_generation = new_generation;
     }
 }
 
-fn dynamic_loop(inner: &Arc<Inner>, thread_index: usize) {
+fn dynamic_loop(inner: &'static Inner, thread_index: usize) {
     let trampoline = inner.trampoline();
     let context = inner.context();
     loop {
-        let idx = inner.task_parts_passed.fetch_add(1, Ordering::Relaxed);
-        if idx >= inner.task_parts_count.load(Ordering::Acquire) {
+        let idx = inner
+            .task_parts_passed
+            .get()
+            .fetch_add(1, Ordering::Relaxed);
+        if idx >= inner.task_parts_count {
             break;
         }
         unsafe {
@@ -338,7 +398,10 @@ fn dynamic_loop(inner: &Arc<Inner>, thread_index: usize) {
                 },
             );
         }
-        inner.task_parts_remaining.fetch_sub(1, Ordering::AcqRel);
+        inner
+            .task_parts_remaining
+            .get()
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -360,31 +423,21 @@ mod tests {
 
     #[test]
     fn spawn_with_global() {
-        let pool = ForkUnion::try_spawn(2).expect("spawn");
+        let pool = ForkUnion::spawn(2);
         assert_eq!(pool.thread_count(), 2);
     }
 
     #[test]
     fn spawn_with_allocator() {
-        let pool: ForkUnion<Global> = ForkUnion::try_spawn_in(2, Global).expect("spawn");
+        let builder = thread::Builder::new().name("ForkUnionTest".to_string());
+        let pool: ForkUnion<Global> = ForkUnion::try_spawn_in(&builder, 2, Global).expect("spawn");
         assert_eq!(pool.thread_count(), 2);
-    }
-
-    #[test]
-    fn try_spawn_success() {
-        let pool = ForkUnion::try_spawn(hw_threads());
-        assert!(pool.is_some());
-    }
-
-    #[test]
-    fn try_spawn_zero_threads() {
-        assert!(ForkUnion::try_spawn(0).is_none());
     }
 
     #[test]
     fn for_each_thread_dispatch() {
         let count_threads = hw_threads();
-        let pool = ForkUnion::try_spawn(count_threads).expect("spawn");
+        let pool = ForkUnion::spawn(count_threads);
 
         let visited = Arc::new(
             (0..count_threads)
@@ -408,7 +461,7 @@ mod tests {
     #[test]
     fn for_each_static_uncomfortable_input_size() {
         let count_threads = hw_threads();
-        let pool = ForkUnion::try_spawn(count_threads).expect("spawn");
+        let pool = ForkUnion::spawn(count_threads);
 
         for input_size in 0..count_threads {
             let out_of_bounds = AtomicBool::new(false);
@@ -427,7 +480,7 @@ mod tests {
     #[test]
     fn for_each_static_static_scheduling() {
         const EXPECTED_PARTS: usize = 10_000_000;
-        let pool = ForkUnion::try_spawn(hw_threads()).expect("spawn");
+        let pool = ForkUnion::spawn(hw_threads());
 
         let visited = Arc::new(
             (0..EXPECTED_PARTS)
@@ -456,7 +509,7 @@ mod tests {
     #[test]
     fn for_each_dynamic_dynamic_scheduling() {
         const EXPECTED_PARTS: usize = 10_000_000;
-        let pool = ForkUnion::try_spawn(hw_threads()).expect("spawn");
+        let pool = ForkUnion::spawn(hw_threads());
 
         let visited = Arc::new(
             (0..EXPECTED_PARTS)
@@ -487,7 +540,7 @@ mod tests {
         const EXPECTED_PARTS: usize = 10_000_000;
         const OVERSUBSCRIPTION: usize = 7;
         let threads = hw_threads() * OVERSUBSCRIPTION;
-        let pool = ForkUnion::try_spawn(threads).expect("spawn");
+        let pool = ForkUnion::spawn(threads);
 
         let visited = Arc::new(
             (0..EXPECTED_PARTS)
@@ -534,7 +587,7 @@ mod tests {
         }
 
         TASK_COUNTER.store(0, Ordering::Relaxed);
-        let pool = ForkUnion::try_spawn(hw_threads()).expect("spawn");
+        let pool = ForkUnion::spawn(hw_threads());
         pool.for_each_dynamic(EXPECTED_PARTS, tally as fn(usize));
 
         assert_eq!(
