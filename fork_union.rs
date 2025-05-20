@@ -650,4 +650,69 @@ mod tests {
             "function-pointer callback executed the wrong number of times"
         );
     }
+
+    #[test]
+    fn concurrent_histogram_array() {
+        const HIST_SIZE: usize = 16;
+        const ELEMENTS: usize = 1_000_000;
+        let pool = spawn(hw_threads());
+
+        let values: Vec<usize> = (0..ELEMENTS).map(|i| i % HIST_SIZE).collect();
+        let histogram = Arc::new(
+            (0..HIST_SIZE)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<_>>(),
+        );
+        let hist_ref = Arc::clone(&histogram);
+
+        pool.for_each_dynamic(ELEMENTS, |task_index| {
+            let value = values[task_index];
+            hist_ref[value].fetch_add(1, Ordering::Relaxed);
+        });
+
+        for (i, counter) in histogram.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                ELEMENTS / HIST_SIZE,
+                "histogram bin {i} has incorrect count",
+            );
+        }
+    }
+
+    fn increment_all(pool: &ForkUnion, data: &[AtomicUsize]) {
+        pool.for_each_static(data.len(), |i| {
+            data[i].fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn pass_pool_and_reuse() {
+        const ELEMENTS: usize = 128;
+        let pool = spawn(hw_threads());
+
+        let data = (0..ELEMENTS)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
+
+        increment_all(&pool, &data);
+        increment_all(&pool, &data);
+
+        for counter in data.iter() {
+            assert_eq!(counter.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn manual_stop_and_reset() {
+        let mut pool = spawn(hw_threads());
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        pool.for_each_static(1000, |_| {
+            COUNTER.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(COUNTER.load(Ordering::Relaxed), 1000);
+        pool.stop_and_reset();
+        pool.stop_and_reset();
+    }
 }
