@@ -2,6 +2,7 @@
 use std::alloc::{AllocError, Allocator, Global};
 use std::cell::UnsafeCell;
 use std::collections::TryReserveError;
+use std::fmt;
 use std::io::Error as IoError;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,6 +13,28 @@ pub enum ForkUnionError {
     Alloc(AllocError),
     Reserve(TryReserveError),
     Spawn(IoError),
+}
+
+impl fmt::Display for ForkUnionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Alloc(_) => write!(f, "allocation failure"),
+            Self::Reserve(e) => write!(f, "reservation failure: {e}"),
+            Self::Spawn(e) => write!(f, "thread-spawn failure: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ForkUnionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // `AllocError` doesn't implement `Error`, so no source here.
+            Self::Alloc(_) => None,
+            // These *do* implement `Error`, forward them.
+            Self::Reserve(e) => Some(e),
+            Self::Spawn(e) => Some(e),
+        }
+    }
 }
 
 /// Describes a portion of work executed on a specific thread.
@@ -42,11 +65,13 @@ impl<T> Padded64<T> {
     fn get(&self) -> &T {
         unsafe { &*self.0.get() }
     }
+    #[allow(dead_code)]
     #[inline(always)]
     unsafe fn get_mut(&self) -> &mut T {
         &mut *self.0.get()
     }
 }
+
 unsafe impl<T: Send> Send for Padded64<T> {}
 unsafe impl<T: Sync> Sync for Padded64<T> {}
 
@@ -135,7 +160,9 @@ impl Inner {
 /// The simplest example of using the pool:
 ///
 /// ```no_run
-/// use fork_union::ForkUnion;
+/// use fork_union::spawn;
+///
+/// fn heavy_math(_: usize) {}
 ///
 /// let pool = spawn(4); // ! Unsafe shortcut, see below
 /// pool.for_each_static(400, |i| {
@@ -143,18 +170,24 @@ impl Inner {
 /// });
 /// ```
 ///
-/// The recommended way, however, is to use the safer `try_spawn_in` method,
-/// that won't panic from a failed `thread::Builder::name` call.
+/// The recommended way, however, is to use the Allocator API and the safer `try_spawn_in` method:
 ///
 /// ```no_run
-/// use fork_union::ForkUnion;
+/// #![feature(allocator_api)]
 /// use std::thread;
+/// use std::error::Error;
 /// use std::alloc::Global;
+/// use fork_union::ForkUnion;
 ///
-/// let pool = ForkUnion::try_spawn_in(4, Global)?;
-/// pool.for_each_dynamic(400, |i| {
-///     heavy_math(i); // More expensive to synchronize, but better for uneven workloads.
-/// });
+/// fn heavy_math(_: usize) {}
+///
+/// fn main() -> Result<(), Box<dyn Error>> {
+///     let pool = ForkUnion::try_spawn_in(4, Global)?;
+///     pool.for_each_dynamic(400, |i| {
+///         heavy_math(i); // More expensive to synchronize, but better for uneven workloads.
+///     });
+///     Ok(())
+/// }
 /// ```
 ///
 pub struct ForkUnion<A: Allocator + Clone = Global> {
