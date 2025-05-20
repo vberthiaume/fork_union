@@ -12,8 +12,8 @@
 #include <cassert> // `assert`
 
 #define FORK_UNION_VERSION_MAJOR 0
-#define FORK_UNION_VERSION_MINOR 2
-#define FORK_UNION_VERSION_PATCH 3
+#define FORK_UNION_VERSION_MINOR 3
+#define FORK_UNION_VERSION_PATCH 0
 
 /**
  *  On C++17 and later we can detect misuse of lambdas that are not properly annotated.
