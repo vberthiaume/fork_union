@@ -1,10 +1,13 @@
 {
     "cSpell.words": [
         "ashvardanian",
+        "Condvar",
         "fprintf",
         "futex",
         "noexcept",
         "NUMA",
+        "println",
+        "repr",
         "SIMT",
         "STREQUAL",
         "syscall",

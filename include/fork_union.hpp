@@ -11,9 +11,9 @@
 #include <cstddef> // `std::max_align_t`
 #include <cassert> // `assert`
 
-#define FORK_UNION_VERSION_MAJOR (0)
-#define FORK_UNION_VERSION_MINOR (1)
-#define FORK_UNION_VERSION_PATCH (1)
+#define FORK_UNION_VERSION_MAJOR 0
+#define FORK_UNION_VERSION_MINOR 1
+#define FORK_UNION_VERSION_PATCH 1
 
 /**
  *  On C++17 and later we can detect misuse of lambdas that are not properly annotated.
@@ -57,7 +57,7 @@ namespace ashvardanian {
  *  use the "acquire-release" model, and some going further to "relaxed" model.
  *  @see https://en.cppreference.com/w/cpp/atomic/memory_order#Release-Acquire_ordering
  */
-template <typename allocator_type_ = std::allocator<std::byte>>
+template <typename allocator_type_ = std::allocator<std::byte>, std::size_t alignment_ = alignof(std::max_align_t)>
 class fork_union {
   public:
     using allocator_t = allocator_type_;
@@ -94,15 +94,15 @@ class fork_union {
     allocator_t allocator_ {};
     std::thread *workers_ {nullptr};
     thread_index_t total_threads_ {0};
-    alignas(std::max_align_t) std::atomic<bool> stop_ {false};
+    alignas(alignment_) std::atomic<bool> stop_ {false};
 
     // Task-specific variables:
     punned_task_context_t task_lambda_pointer_ {nullptr};    // ? Pointer to the users lambda
     trampoline_pointer_t task_trampoline_pointer_ {nullptr}; // ? Calls the lambda
     task_index_t task_parts_count_ {0};
-    alignas(std::max_align_t) std::atomic<task_index_t> task_parts_remaining_ {0};
-    alignas(std::max_align_t) std::atomic<task_index_t> task_parts_passed_ {0}; // ? Only used in dynamic mode
-    alignas(std::max_align_t) std::atomic<std::size_t> task_generation_ {0};
+    alignas(alignment_) std::atomic<task_index_t> task_parts_remaining_ {0};
+    alignas(alignment_) std::atomic<task_index_t> task_parts_passed_ {0}; // ? Only used in dynamic mode
+    alignas(alignment_) std::atomic<std::size_t> task_generation_ {0};
 
   public:
     fork_union(fork_union &&) = delete;
@@ -173,9 +173,10 @@ class fork_union {
         // Deallocate the thread pool
         allocator_.deallocate(workers_, worker_threads);
 
-        // We don't have to reset the following variables, but it's a good practice
+        // Prepare for future spawns
         total_threads_ = 0;
         workers_ = nullptr;
+        stop_.store(false, std::memory_order_relaxed);
     }
 
     /**

@@ -1,8 +1,9 @@
 # Fork Union
 
-The __`fork_union`__ library is a thread-pool for "Fork-Join" [SIMT-style](https://en.wikipedia.org/wiki/Single_instruction,_multiple_threads) parallelism in modern C++.
-It's quite different from most open-source C++ thread-pool implementations, generally designed around a `std::queue` of `std::function` tasks, synchronized by a `std::mutex`.
-Wrapping tasks into `std::function` is expensive, as is growing the `std::queue` and locking the `std::mutex` under contention.
+The __`fork_union`__ library is a thread-pool for "Fork-Join" [SIMT-style](https://en.wikipedia.org/wiki/Single_instruction,_multiple_threads) parallelism for Rust and C++.
+It's quite different from most open-source thread-pool implementations, generally designed around heap-allocated "queues of tasks", synchronized by a "mutex".
+In C++, wrapping tasks into a `std::function` is expensive, as is growing the `std::queue` and locking the `std::mutex` under contention.
+Same for Rust.
 When you can avoid it - you should.
 OpenMP-like use-cases are the perfect example of that!
 
@@ -19,7 +20,61 @@ The __`fork_union`__ supports just 2 operation modes:
 - __"Dynamic"__ - work-stealing for uneven workloads.
 
 There is no nested parallelism, exception-handling, or "futures promises".
-To integrate into your project, either just copy the `fork_union.hpp` file into your project, add a Git submodule, or CMake.
+Only 4 simple APIs:
+
+- `for_each_thread` - to dispatch a callback per thread.
+- `for_each_static` - for individual evenly-sized tasks.
+- `for_each_slice` - for slices of evenly-sized tasks.
+- `for_each_dynamic` - for individual unevenly-sized tasks.
+
+Both are available in C++ and Rust.
+
+### Usage in Rust
+
+A minimal example may look like this:
+
+```rs
+use fork_union::spawn;
+let pool = spawn(2);
+pool.for_each_thread(|thread_index| {
+    println!("Hello from thread # {}", thread_index + 1);
+});
+pool.for_each_static(1000, |task_index| {
+    println!("Running task {} of 3", task_index + 1);
+});
+pool.for_each_slice(1000, |first_index, count| {
+    println!("Running slice [{}, {})", first_index, first_index + count);
+});
+pool.for_each_dynamic(1000, |task_index| {
+    println!("Running dynamic task {} of 1000", task_index + 1);
+});
+
+```
+
+A safer `try_spawn_in` interface is recommended, using the Allocator API.
+A more realistic example may look like this:
+
+```rs
+#![feature(allocator_api)]
+use std::thread;
+use std::error::Error;
+use std::alloc::Global;
+use fork_union::ForkUnion;
+
+fn heavy_math(_: usize) {}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let pool = ForkUnion::try_spawn_in(4, Global)?;
+    pool.for_each_dynamic(400, |i| {
+        heavy_math(i);
+    });
+    Ok(())
+}
+```
+
+### Usage in C++
+
+To integrate into your C++ project, either just copy the `include/fork_union.hpp` file into your project, add a Git submodule, or CMake.
 For a Git submodule, run:
 
 ```bash
@@ -89,12 +144,20 @@ That's it.
 
 ## Why Not Use $𝑋$
 
-There are many other thread-pool implementations, that are more feature-rich, but have different limitations and design goals:
+There are many other thread-pool implementations, that are more feature-rich, but have different limitations and design goals.
+Both in C++:
 
+- [`taskflow/taskflow`](https://github.com/taskflow/taskflow) ![https://github.com/taskflow/taskflow](https://img.shields.io/github/stars/taskflow/taskflow)
 - [`progschj/ThreadPool`](https://github.com/progschj/ThreadPool) ![https://github.com/progschj/ThreadPool](https://img.shields.io/github/stars/progschj/ThreadPool)
 - [`bshoshany/thread-pool`](https://github.com/bshoshany/thread-pool) ![https://github.com/bshoshany/thread-pool](https://img.shields.io/github/stars/bshoshany/thread-pool)
 - [`vit-vit/CTPL`](https://github.com/vit-vit/CTPL) ![https://github.com/vit-vit/CTPL](https://img.shields.io/github/stars/vit-vit/CTPL)
 - [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool) ![https://github.com/mtrebi/thread-pool](https://img.shields.io/github/stars/mtrebi/thread-pool)
+
+... and in Rust:
+
+- [`tokio-rs/tokio`](https://github.com/tokio-rs/tokio) ![https://github.com/tokio-rs/tokio](https://img.shields.io/github/stars/tokio-rs/tokio)
+- [`rayon-rs/rayon`](https://github.com/rayon-rs/rayon) ![https://github.com/rayon-rs/rayon](https://img.shields.io/github/stars/rayon-rs/rayon)
+- [`smol-rs/smol`](https://github.com/smol-rs/smol) ![https://github.com/smol-rs/smol](https://img.shields.io/github/stars/smol-rs/smol)
 
 Those are not designed for the same OpenMP-like use-cases as __`fork_union`__.
 Instead, they primarily focus on task queueing, which requires a lot more work.
@@ -145,9 +208,25 @@ Assuming a thread-pool is a heavy object anyway, nobody will care if it's a bit 
 That allows us to over-align the internal counters to `std::max_align_t` to avoid false sharing.
 In that case, even on x86, where the entire cache will be exclusively owned by a single thread, in eager mode, we end up effectively "pipelining" the execution, where one thread may be incrementing the "in-flight" counter, while the other is decrementing the "remaining" counter, and others are executing the loop body in-between.
 
+## Performance
+
+The performance goal of Fork Union is to be comparable to OpenMP when running on a single NUMA node.
+In [Parallel Reductions](https://github.com/ashvardanian/ParallelReductionsBenchmark), on tiny inputs, it has the following performance:
+
+```bash
+$ PARALLEL_REDUCTIONS_LENGTH=1536 build_release/reduce_bench
+----------------------------------------------------------------------------
+Benchmark                 Time             CPU   Iterations UserCounters...
+----------------------------------------------------------------------------
+std::threads         2047275 ns      2008267 ns        13751 bytes/s=3.00106M/s
+tf::taskflow          109782 ns       106764 ns       254660 bytes/s=76.2837M/s
+av::fork_union         13136 ns        13136 ns      2117597 bytes/s=467.714M/s
+openmp                 10494 ns        10256 ns      2848849 bytes/s=585.492M/s
+```
+
 ## Testing
 
-To run the tests, use CMake:
+To run the C++ tests, use CMake:
 
 ```bash
 cmake -B build_release -D CMAKE_BUILD_TYPE=Release
@@ -155,10 +234,17 @@ cmake --build build_release --config Release
 build_release/scripts/fork_union_test_cpp20
 ```
 
-For debug builds, consider using the VS Code debugger presets or the following commands:
+For C++ debug builds, consider using the VS Code debugger presets or the following commands:
 
 ```bash
 cmake -B build_debug -D CMAKE_BUILD_TYPE=Debug
 cmake --build build_debug --config Debug
 build_debug/scripts/fork_union_test_cpp20
+```
+
+For Rust, use the following command:
+
+```bash
+rustup toolchain install nightly
+cargo +nightly test --release
 ```
