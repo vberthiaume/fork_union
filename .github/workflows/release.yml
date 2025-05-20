@@ -45,3 +45,20 @@ jobs:
           push: "true"
           create-release: "true"
           github-token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+
+  publish_rust:
+    name: Publish Rust
+    runs-on: ubuntu-24.04
+    needs: versioning
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "main"
+      - run: git submodule update --init --recursive
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: katyo/publish-crates@v2
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
