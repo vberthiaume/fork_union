@@ -33,6 +33,8 @@ jobs:
           version-file: "VERSION"
           update-version-in: |
             CMakeLists.txt:^\s*VERSION (\d+\.\d+\.\d+)
+            Cargo.toml:^version = "(\d+\.\d+\.\d+)"
+            Cargo.lock:name = "fork_union"\nversion = "(\d+\.\d+\.\d+)"
           update-major-version-in: |
             include/fork_union.hpp:^#define FORK_UNION_VERSION_MAJOR (\d+)
           update-minor-version-in: |
