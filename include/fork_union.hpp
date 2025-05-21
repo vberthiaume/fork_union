@@ -10,6 +10,7 @@
 #include <atomic>  // `std::atomic`
 #include <cstddef> // `std::max_align_t`
 #include <cassert> // `assert`
+#include <new>     // `std::hardware_destructive_interference_size`
 
 #define FORK_UNION_VERSION_MAJOR 0
 #define FORK_UNION_VERSION_MINOR 3
@@ -40,6 +41,16 @@
 namespace ashvardanian {
 
 /**
+ *  @brief Defines variable alignment to avoid false sharing.
+ *  @see https://en.cppreference.com/w/cpp/thread/hardware_destructive_interference_size
+ */
+#if defined(__cpp_lib_hardware_interference_size)
+static constexpr std::size_t default_alignment_k = std::hardware_destructive_interference_size;
+#else
+static constexpr std::size_t default_alignment_k = alignof(std::max_align_t);
+#endif
+
+/**
  *  @brief Minimalistic STL-based non-resizable thread-pool for simultaneous blocking tasks.
  *
  *  Note, that for N-wide parallelism, it initiates (N-1) threads, and the current caller thread
@@ -57,7 +68,7 @@ namespace ashvardanian {
  *  use the "acquire-release" model, and some going further to "relaxed" model.
  *  @see https://en.cppreference.com/w/cpp/atomic/memory_order#Release-Acquire_ordering
  */
-template <typename allocator_type_ = std::allocator<std::byte>, std::size_t alignment_ = alignof(std::max_align_t)>
+template <typename allocator_type_ = std::allocator<std::byte>, std::size_t alignment_ = default_alignment_k>
 class fork_union {
   public:
     using allocator_t = allocator_type_;
