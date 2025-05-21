@@ -103,10 +103,10 @@ Then, include the header in your C++ code:
 #include <cstdio>           // `stderr`
 #include <cstdlib>          // `EXIT_SUCCESS`
 
-namespace av = ashvardanian;
+namespace fun = ashvardanian::fork_union;
 
 int main() {
-    av::fork_union_t pool;
+    fun::fork_union_t pool;
     if (!pool.try_spawn(std::thread::hardware_concurrency())) {
         std::fprintf(stderr, "Failed to fork the threads\n");
         return EXIT_FAILURE;

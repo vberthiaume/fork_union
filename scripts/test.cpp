@@ -5,7 +5,7 @@
 
 #include <fork_union.hpp>
 
-namespace av = ashvardanian;
+namespace fun = ashvardanian::fork_union;
 
 using test_func_t = bool() noexcept;
 
@@ -15,14 +15,14 @@ struct test_t {
 };
 
 static bool test_try_spawn_success() noexcept {
-    av::fork_union_t pool;
+    fun::fork_union_t pool;
     auto const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
     return true;
 }
 
 static bool test_try_spawn_zero() noexcept {
-    av::fork_union_t pool;
+    fun::fork_union_t pool;
     return !pool.try_spawn(0u);
 }
 
@@ -31,7 +31,7 @@ static bool test_for_each_thread() noexcept {
     auto const count_threads = std::thread::hardware_concurrency();
     std::vector<char> visited(count_threads, 0);
     {
-        av::fork_union_t pool;
+        fun::fork_union_t pool;
         if (!pool.try_spawn(count_threads)) return false;
         pool.for_each_thread([&](std::size_t const thread_index) noexcept { visited[thread_index] = 1; });
     }
@@ -44,7 +44,7 @@ static bool test_for_each_thread() noexcept {
 static bool test_uncomfortable_input_size() noexcept {
     auto const count_threads = std::thread::hardware_concurrency();
 
-    av::fork_union_t pool;
+    fun::fork_union_t pool;
     if (!pool.try_spawn(count_threads)) return false;
 
     for (std::size_t input_size = 0; input_size < count_threads; ++input_size) {
@@ -65,7 +65,7 @@ static bool test_for_each_static() noexcept {
     std::vector<std::size_t> visited(expected_parts, 0);
     std::atomic<std::size_t> counter = 0;
     {
-        av::fork_union_t pool;
+        fun::fork_union_t pool;
         auto const count_threads = std::thread::hardware_concurrency();
         if (!pool.try_spawn(count_threads)) return false;
         pool.for_each_static(expected_parts, [&](std::size_t const task_index) noexcept {
@@ -86,7 +86,7 @@ static bool test_for_each_static() noexcept {
 static bool test_for_each_dynamic() noexcept {
     constexpr std::size_t expected_parts = 10'000'000;
 
-    av::fork_union_t pool;
+    fun::fork_union_t pool;
     auto const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
     std::vector<std::size_t> visited(expected_parts, 0);
@@ -109,7 +109,7 @@ static bool test_oversubscribed_unbalanced_threads() noexcept {
     constexpr std::size_t expected_parts = 10'000'000;
     constexpr std::size_t oversubscription = 7;
 
-    av::fork_union_t pool;
+    fun::fork_union_t pool;
     auto const count_threads = std::thread::hardware_concurrency() * oversubscription;
     if (!pool.try_spawn(count_threads)) return false;
     std::vector<std::size_t> visited(expected_parts, 0);
@@ -136,8 +136,8 @@ struct c_function_context_t {
     std::atomic<std::size_t> &counter;
 };
 
-extern "C" void _handle_one_task(av::fork_union_t::punned_task_context_t punned_context,
-                                 av::fork_union_t::task_t task) {
+extern "C" void _handle_one_task(fun::fork_union_t::punned_task_context_t punned_context,
+                                 fun::fork_union_t::task_t task) {
     c_function_context_t const &context = *static_cast<c_function_context_t const *>(punned_context);
     // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
     std::size_t const count_populated = context.counter.fetch_add(1, std::memory_order_relaxed);
@@ -149,13 +149,13 @@ static bool test_c_function_pointers() noexcept {
 
     constexpr std::size_t expected_parts = 10'000'000;
 
-    av::fork_union_t pool;
+    fun::fork_union_t pool;
     auto const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
     std::vector<std::size_t> visited(expected_parts, 0);
     std::atomic<std::size_t> counter = 0;
     c_function_context_t context {visited.data(), counter};
-    pool.for_each_dynamic(expected_parts, av::fork_union_t::c_callback_t {&_handle_one_task, &context});
+    pool.for_each_dynamic(expected_parts, fun::fork_union_t::c_callback_t {&_handle_one_task, &context});
 
     // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
     std::sort(visited.begin(), visited.end());

@@ -39,6 +39,7 @@
 #endif
 
 namespace ashvardanian {
+namespace fork_union {
 
 /**
  *  @brief Defines variable alignment to avoid false sharing.
@@ -392,4 +393,5 @@ class fork_union {
 
 using fork_union_t = fork_union<std::allocator<std::thread>>;
 
+} // namespace fork_union
 } // namespace ashvardanian
