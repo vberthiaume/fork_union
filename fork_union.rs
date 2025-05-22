@@ -1,13 +1,14 @@
 #![feature(allocator_api)]
 use core::fmt::Write as _;
 use std::alloc::{AllocError, Allocator, Global};
-use std::cell::UnsafeCell;
 use std::collections::TryReserveError;
 use std::fmt;
 use std::io::Error as IoError;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
+
+use crossbeam_utils::CachePadded;
 
 #[derive(Debug)]
 pub enum ForkUnionError {
@@ -52,30 +53,6 @@ unsafe fn dummy_trampoline(_ctx: *const (), _task: Task) {
     unreachable!("dummy_trampoline should not be called")
 }
 
-/// Rust doesn't allow over-aligning struct members, so we pack them into `Padded64<T>`
-/// to ensure that high-contention atomics are placed on separate cache lines.
-#[repr(align(64))]
-struct Padded64<T>(UnsafeCell<T>);
-
-impl<T> Padded64<T> {
-    #[inline(always)]
-    const fn new(val: T) -> Self {
-        Self(UnsafeCell::new(val))
-    }
-    #[inline(always)]
-    fn get(&self) -> &T {
-        unsafe { &*self.0.get() }
-    }
-    #[allow(dead_code)]
-    #[inline(always)]
-    unsafe fn get_mut(&self) -> &mut T {
-        &mut *self.0.get()
-    }
-}
-
-unsafe impl<T: Send> Send for Padded64<T> {}
-unsafe impl<T: Sync> Sync for Padded64<T> {}
-
 /// The shared state of the thread pool, used by all threads.
 /// It intentionally pads all of independently mutable regions to avoid false sharing.
 /// The `task_trampoline` function receives the `task_context` state pointers and
@@ -87,10 +64,10 @@ struct Inner {
     pub task_trampoline: Trampoline,
     pub task_parts_count: usize,
 
-    pub stop: Padded64<AtomicBool>,
-    pub task_parts_remaining: Padded64<AtomicUsize>,
-    pub task_parts_passed: Padded64<AtomicUsize>,
-    pub task_generation: Padded64<AtomicUsize>,
+    pub stop: CachePadded<AtomicBool>,
+    pub task_parts_remaining: CachePadded<AtomicUsize>,
+    pub task_parts_passed: CachePadded<AtomicUsize>,
+    pub task_generation: CachePadded<AtomicUsize>,
 }
 
 unsafe impl Sync for Inner {}
@@ -99,15 +76,15 @@ unsafe impl Send for Inner {}
 impl Inner {
     pub fn new(threads: usize) -> Self {
         Self {
-            stop: Padded64::new(AtomicBool::new(false)),
+            stop: CachePadded::new(AtomicBool::new(false)),
             total_threads: threads,
             task_context: ptr::null(),
             task_trampoline: dummy_trampoline,
             task_parts_count: 0,
 
-            task_parts_remaining: Padded64::new(AtomicUsize::new(0)),
-            task_parts_passed: Padded64::new(AtomicUsize::new(0)),
-            task_generation: Padded64::new(AtomicUsize::new(0)),
+            task_parts_remaining: CachePadded::new(AtomicUsize::new(0)),
+            task_parts_passed: CachePadded::new(AtomicUsize::new(0)),
+            task_generation: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -238,7 +215,7 @@ impl<A: Allocator + Clone> ForkUnion<A> {
             unsafe {
                 let worker = thread::Builder::new()
                     .name(worker_name)
-                    .spawn_unchecked(move || worker_loop(&*inner_ptr, i + 1))
+                    .spawn_unchecked(move || worker_loop(inner_ptr, i + 1))
                     .map_err(ForkUnionError::Spawn)?;
                 workers.push(worker);
             }
@@ -262,13 +239,13 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         if self.inner.total_threads <= 1 {
             return;
         }
-        assert!(self.inner.task_parts_remaining.get().load(Ordering::SeqCst) == 0);
+        assert!(self.inner.task_parts_remaining.load(Ordering::SeqCst) == 0);
         self.inner.reset_task();
-        self.inner.stop.get().store(true, Ordering::Release);
+        self.inner.stop.store(true, Ordering::Release);
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
-        self.inner.stop.get().store(false, Ordering::Relaxed);
+        self.inner.stop.store(false, Ordering::Relaxed);
     }
 
     /// Executes a function on each thread of the pool.
@@ -289,17 +266,14 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         }
         self.inner
             .task_parts_remaining
-            .get()
             .store(self.inner.total_threads - 1, Ordering::Relaxed);
         self.inner
             .task_generation
-            .get()
             .fetch_add(1, Ordering::Release);
         function(0);
         while self
             .inner
             .task_parts_remaining
-            .get()
             .load(Ordering::Acquire)
             != 0
         {
@@ -321,7 +295,7 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         if n == 0 {
             return;
         }
-        let per_thread = (n + self.inner.total_threads - 1) / self.inner.total_threads;
+        let per_thread = n.div_ceil(self.inner.total_threads);
         self.for_each_thread(|thread_index| {
             let begin = std::cmp::min(thread_index * per_thread, n);
             let count = std::cmp::min(begin + per_thread, n) - begin;
@@ -368,15 +342,12 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         }
         self.inner
             .task_parts_passed
-            .get()
             .store(0, Ordering::Relaxed);
         self.inner
             .task_parts_remaining
-            .get()
             .store(n, Ordering::Relaxed);
         self.inner
             .task_generation
-            .get()
             .fetch_add(1, Ordering::Release);
         // SAFETY: `self.inner` lives as long as the pool
         let inner_ref: &'static Inner = unsafe { &*(self.inner.as_ref() as *const Inner) };
@@ -384,7 +355,6 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         while self
             .inner
             .task_parts_remaining
-            .get()
             .load(Ordering::Acquire)
             != 0
         {
@@ -428,12 +398,12 @@ fn worker_loop(inner: &'static Inner, thread_index: usize) {
     loop {
         let mut new_generation;
         while {
-            new_generation = inner.task_generation.get().load(Ordering::Acquire);
-            new_generation == last_generation && !inner.stop.get().load(Ordering::Acquire)
+            new_generation = inner.task_generation.load(Ordering::Acquire);
+            new_generation == last_generation && !inner.stop.load(Ordering::Acquire)
         } {
             thread::yield_now();
         }
-        if inner.stop.get().load(Ordering::Acquire) {
+        if inner.stop.load(Ordering::Acquire) {
             return;
         }
         let is_static = inner.task_parts_count == inner.total_threads;
@@ -451,7 +421,6 @@ fn worker_loop(inner: &'static Inner, thread_index: usize) {
             }
             inner
                 .task_parts_remaining
-                .get()
                 .fetch_sub(1, Ordering::AcqRel);
         } else {
             dynamic_loop(inner, thread_index);
@@ -466,7 +435,6 @@ fn dynamic_loop(inner: &'static Inner, thread_index: usize) {
     loop {
         let idx = inner
             .task_parts_passed
-            .get()
             .fetch_add(1, Ordering::Relaxed);
         if idx >= inner.task_parts_count {
             break;
@@ -482,14 +450,13 @@ fn dynamic_loop(inner: &'static Inner, thread_index: usize) {
         }
         inner
             .task_parts_remaining
-            .get()
             .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 /// Spawns a pool with the default allocator.
 pub fn spawn(planned_threads: usize) -> ForkUnion<Global> {
-    ForkUnion::<Global>::try_spawn_in(planned_threads, Global::default())
+    ForkUnion::<Global>::try_spawn_in(planned_threads, Global)
         .expect("Failed to spawn ForkUnion thread pool")
 }
 
