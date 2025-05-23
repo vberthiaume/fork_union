@@ -57,6 +57,11 @@ static constexpr std::size_t default_alignment_k = alignof(std::max_align_t);
  *  Note, that for N-wide parallelism, it initiates (N-1) threads, and the current caller thread
  *  is also executing tasks. The number of threads is fixed and cannot be changed.
  *
+ *  Note, the pool is not re-entrant! So you can't recursively submit new tasks!
+ *
+ *  Note, the pool can't be copied or moved, as it's worker threads depend on the address
+ *  of the parent structure, spawning them.
+ *
  *  It avoids heap allocations and expensive abstractions like `std::function`, `std::future`,
  *  `std::promise`, `std::condition_variable`, etc. It only uses `std::thread` and `std::atomic`,
  *  benefiting from the fact, that those are standardized since C++11.
