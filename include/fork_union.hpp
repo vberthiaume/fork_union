@@ -52,6 +52,20 @@ static constexpr std::size_t default_alignment_k = alignof(std::max_align_t);
 #endif
 
 /**
+ *  @brief Defines saturated addition for a given unsigned integer type.
+ *  @see https://en.cppreference.com/w/cpp/numeric/add_sat
+ */
+template <typename scalar_type_>
+inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
+    static_assert(std::is_unsigned<scalar_type_>::value, "Scalar type must be an unsigned integer");
+#if defined(__cpp_lib_saturation_arithmetic)
+    return std::add_sat(a, b); // In C++26
+#else
+    return (std::numeric_limits<scalar_type_>::max() - a < b) ? std::numeric_limits<scalar_type_>::max() : a + b;
+#endif
+}
+
+/**
  *  @brief Minimalistic STL-based non-resizable thread-pool for simultaneous blocking tasks.
  *
  *  Note, that for N-wide parallelism, it initiates (N-1) threads, and the current caller thread
@@ -262,10 +276,20 @@ class fork_union {
         // Instead, we can do: `n / total_threads_ + (n % total_threads_ != 0)`,
         // but avoiding the cost of the second integer division, replacing it with multiplication.
         task_index_t const n_per_thread_lower_bound = n / total_threads_;
-        task_index_t const n_per_thread = n_per_thread_lower_bound + (n_per_thread_lower_bound * total_threads_ != n);
-        for_each_thread([n, n_per_thread, function](thread_index_t thread_index) noexcept {
-            task_index_t const begin = (std::min<task_index_t>)(thread_index * n_per_thread, n);
-            task_index_t const count = (std::min<task_index_t>)(begin + n_per_thread, n) - begin;
+        task_index_t const n_per_thread = n_per_thread_lower_bound + ((n_per_thread_lower_bound * total_threads_) < n);
+        for_each_thread([n, n_per_thread, n_per_thread_lower_bound, function](thread_index_t thread_index) noexcept {
+            // Multiplying `thread_index` by `n_per_thread` may overflow. For an 8-bit `task_index_t` type:
+            // - 254 threads,
+            // - 255 tasks,
+            // - each thread gets 1 or 2 tasks
+            // In that case, both `begin` and `begin_lower_bound` will overflow, but we can use
+            // their relative values to determine the real slice length for the thread.
+            task_index_t const begin = thread_index * n_per_thread;                         // ? Handled overflow
+            task_index_t const begin_lower_bound = n_per_thread_lower_bound * thread_index; // ? Handled overflow
+            bool const begin_overflows = begin_lower_bound > begin;
+            bool const begin_exceeds_n = begin >= n;
+            if (begin_overflows || begin_exceeds_n) return;
+            task_index_t const count = (std::min<task_index_t>)(add_sat(begin, n_per_thread), n) - begin;
             function(task_t {thread_index, begin}, count);
         });
     }
