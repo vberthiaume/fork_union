@@ -23,3 +23,13 @@ foreach (STD IN LISTS CXX_STANDARDS)
         target_link_options(${TGT} PRIVATE -fsanitize=thread)
     endif ()
 endforeach ()
+
+# Include the N-body benchmark
+add_executable(fork_union_nbody nbody.cpp)
+target_link_libraries(fork_union_nbody PRIVATE fork_union)
+target_compile_features(fork_union_nbody PRIVATE cxx_std_20)
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(STATUS "Enabling OpenMP for fork_union_nbody")
+    target_compile_options(fork_union_nbody PRIVATE -fopenmp)
+    target_link_options(fork_union_nbody PRIVATE -fopenmp)
+endif ()
