@@ -441,7 +441,7 @@ class fork_union {
             // If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
             // of computational time we will wrap around the `std::size_t` capacity for the `new_task_index`.
             // In case we `task_parts_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
-            bool const beyond_task_and_overflow = task_parts_count < last_executed_task_in_this_thread;
+            bool const beyond_task_and_overflow = new_task_index < last_executed_task_in_this_thread;
             if (beyond_task_and_overflow) [[unlikely]]
                 break;
 
