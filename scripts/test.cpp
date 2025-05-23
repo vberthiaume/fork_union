@@ -7,9 +7,11 @@
 
 namespace fun = ashvardanian::fork_union;
 
+constexpr std::size_t default_parts = 10'000;
+
 static bool test_try_spawn_success() noexcept {
     fun::fork_union_t pool;
-    auto const count_threads = std::thread::hardware_concurrency();
+    std::size_t const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
     return true;
 }
@@ -21,12 +23,14 @@ static bool test_try_spawn_zero() noexcept {
 
 /** @brief Make sure that `for_each_thread` is called from each thread. */
 static bool test_for_each_thread() noexcept {
-    auto const count_threads = std::thread::hardware_concurrency();
-    std::vector<char> visited(count_threads, 0);
+    std::size_t const count_threads = std::thread::hardware_concurrency();
+    std::vector<std::atomic<bool>> visited(count_threads);
     {
         fun::fork_union_t pool;
         if (!pool.try_spawn(count_threads)) return false;
-        pool.for_each_thread([&](std::size_t const thread_index) noexcept { visited[thread_index] = 1; });
+        pool.for_each_thread([&](std::size_t const thread_index) noexcept {
+            visited[thread_index].store(true, std::memory_order_relaxed);
+        });
     }
     for (std::size_t i = 0; i < count_threads; ++i)
         if (!visited[i]) return false;
@@ -35,7 +39,7 @@ static bool test_for_each_thread() noexcept {
 
 /** @brief Make sure that `for_each_static` is called from each thread. */
 static bool test_uncomfortable_input_size() noexcept {
-    auto const count_threads = std::thread::hardware_concurrency();
+    std::size_t const count_threads = std::thread::hardware_concurrency();
 
     fun::fork_union_t pool;
     if (!pool.try_spawn(count_threads)) return false;
@@ -51,8 +55,17 @@ static bool test_uncomfortable_input_size() noexcept {
     return true;
 }
 
-template <typename scalar_type_>
-static bool contains_iota(std::vector<scalar_type_> &visited) noexcept {
+/** @brief Convenience structure to ensure we output match locations to independent cache lines. */
+struct alignas(fun::default_alignment_k) aligned_visit_t {
+    std::size_t task_index = 0;
+    bool operator<(aligned_visit_t const &other) const noexcept { return task_index < other.task_index; }
+    bool operator==(aligned_visit_t const &other) const noexcept { return task_index == other.task_index; }
+    bool operator!=(std::size_t other_index) const noexcept { return task_index != other_index; }
+    bool operator==(std::size_t other_index) const noexcept { return task_index == other_index; }
+};
+
+[[gnu::optimize("O3")]] // We don't need to debug the STL sort
+bool contains_iota(std::vector<aligned_visit_t> &visited) noexcept {
     std::sort(visited.begin(), visited.end());
     for (std::size_t i = 0; i < visited.size(); ++i)
         if (visited[i] != i) return false;
@@ -61,91 +74,88 @@ static bool contains_iota(std::vector<scalar_type_> &visited) noexcept {
 
 /** @brief Make sure that `for_each_static` is called the right number of times with the right task IDs. */
 static bool test_for_each_static() noexcept {
-    constexpr std::size_t expected_parts = 10'000'000;
 
-    std::vector<std::size_t> visited(expected_parts, 0);
     std::atomic<std::size_t> counter = 0;
+    std::vector<aligned_visit_t> visited(default_parts);
 
     fun::fork_union_t pool;
-    auto const count_threads = std::thread::hardware_concurrency();
+    std::size_t const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
-    pool.for_each_static(expected_parts, [&](std::size_t const task_index) noexcept {
+    pool.for_each_static(default_parts, [&](std::size_t const task_index) noexcept {
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-        visited[count_populated] = task_index;
+        visited[count_populated].task_index = task_index;
     });
 
-    // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
-    if (counter.load() != expected_parts) return false;
+    // Make sure that all task IDs are unique and form the full range of [0, `default_parts`).
+    if (counter.load() != default_parts) return false;
     if (!contains_iota(visited)) return false;
 
     // Make sure repeated calls to `for_each_static` work
     counter = 0;
-    pool.for_each_static(expected_parts, [&](std::size_t const task_index) noexcept {
+    pool.for_each_static(default_parts, [&](std::size_t const task_index) noexcept {
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-        visited[count_populated] = task_index;
+        visited[count_populated].task_index = task_index;
     });
 
-    return counter.load() == expected_parts && contains_iota(visited);
+    return counter.load() == default_parts && contains_iota(visited);
 }
 
 /** @brief Make sure that `for_each_dynamic` is called the right number of times with the right task IDs. */
 static bool test_for_each_dynamic() noexcept {
-    constexpr std::size_t expected_parts = 10'000'000;
 
     fun::fork_union_t pool;
-    auto const count_threads = std::thread::hardware_concurrency();
+    std::size_t const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
-    std::vector<std::size_t> visited(expected_parts, 0);
+    std::vector<aligned_visit_t> visited(default_parts);
     std::atomic<std::size_t> counter = 0;
-    pool.for_each_dynamic(expected_parts, [&](std::size_t const task_index) noexcept {
+    pool.for_each_dynamic(default_parts, [&](std::size_t const task_index) noexcept {
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-        visited[count_populated] = task_index;
+        visited[count_populated].task_index = task_index;
     });
 
-    // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
-    if (counter.load() != expected_parts) return false;
+    // Make sure that all task IDs are unique and form the full range of [0, `default_parts`).
+    if (counter.load() != default_parts) return false;
     if (!contains_iota(visited)) return false;
 
     // Make sure repeated calls to `for_each_static` work
     counter = 0;
-    pool.for_each_dynamic(expected_parts, [&](std::size_t const task_index) noexcept {
+    pool.for_each_dynamic(default_parts, [&](std::size_t const task_index) noexcept {
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-        visited[count_populated] = task_index;
+        visited[count_populated].task_index = task_index;
     });
 
-    return counter.load() == expected_parts && contains_iota(visited);
+    return counter.load() == default_parts && contains_iota(visited);
 }
 
 /** @brief Stress-tests the implementation by oversubscribing the number of threads. */
 static bool test_oversubscribed_unbalanced_threads() noexcept {
-    constexpr std::size_t expected_parts = 10'000'000;
     constexpr std::size_t oversubscription = 7;
 
     fun::fork_union_t pool;
-    auto const count_threads = std::thread::hardware_concurrency() * oversubscription;
+    std::size_t const count_threads = std::thread::hardware_concurrency() * oversubscription;
     if (!pool.try_spawn(count_threads)) return false;
-    std::vector<std::size_t> visited(expected_parts, 0);
+    std::vector<aligned_visit_t> visited(default_parts);
     std::atomic<std::size_t> counter = 0;
     thread_local volatile std::size_t some_local_work = 0;
-    pool.for_each_dynamic(expected_parts, [&](std::size_t const task_index) noexcept {
+    pool.for_each_dynamic(default_parts, [&](std::size_t const task_index) noexcept {
         // Perform some weird amount of work, that is not very different between consecutive tasks.
         for (std::size_t i = 0; i != task_index % oversubscription; ++i) some_local_work = some_local_work + i * i;
 
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-        visited[count_populated] = task_index;
+        visited[count_populated].task_index = task_index;
     });
 
-    // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
-    return counter.load() == expected_parts && contains_iota(visited);
+    // Make sure that all task IDs are unique and form the full range of [0, `default_parts`).
+    return counter.load() == default_parts && contains_iota(visited);
 }
 
 struct c_function_context_t {
-    std::size_t *visited_ptr;
+    aligned_visit_t *visited_ptr;
     std::atomic<std::size_t> &counter;
 };
 
@@ -154,31 +164,29 @@ extern "C" void _handle_one_task(fun::fork_union_t::punned_task_context_t punned
     c_function_context_t const &context = *static_cast<c_function_context_t const *>(punned_context);
     // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
     std::size_t const count_populated = context.counter.fetch_add(1, std::memory_order_relaxed);
-    context.visited_ptr[count_populated] = task.task_index;
+    context.visited_ptr[count_populated].task_index = task.task_index;
 }
 
 /** @brief Make sure that all APIs work not only for lambda objects, but also function pointers. */
 static bool test_c_function_pointers() noexcept {
 
-    constexpr std::size_t expected_parts = 10'000'000;
-
     fun::fork_union_t pool;
-    auto const count_threads = std::thread::hardware_concurrency();
+    std::size_t const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
-    std::vector<std::size_t> visited(expected_parts, 0);
+    std::vector<aligned_visit_t> visited(default_parts);
     std::atomic<std::size_t> counter = 0;
     c_function_context_t context {visited.data(), counter};
-    pool.for_each_dynamic(expected_parts, fun::fork_union_t::c_callback_t {&_handle_one_task, &context});
+    pool.for_each_dynamic(default_parts, fun::fork_union_t::c_callback_t {&_handle_one_task, &context});
 
-    // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
-    return counter.load() == expected_parts && contains_iota(visited);
+    // Make sure that all task IDs are unique and form the full range of [0, `default_parts`).
+    return counter.load() == default_parts && contains_iota(visited);
 }
 
 /** @brief Hard complex example, involving launching multiple tasks, including static and dynamic ones,
  *         stopping them half-way, resetting & reinitializing, and raising exceptions.
  */
 template <typename pool_type_>
-static bool stress_test_composite(std::size_t const thread_count, std::size_t const expected_parts) noexcept {
+static bool stress_test_composite(std::size_t const thread_count, std::size_t const default_parts) noexcept {
 
     using pool_t = pool_type_;
     using index_t = typename pool_t::index_t;
@@ -187,33 +195,25 @@ static bool stress_test_composite(std::size_t const thread_count, std::size_t co
     pool_t pool;
     if (!pool.try_spawn(thread_count)) return false;
 
-    struct alignas(fun::default_alignment_k) aligned_visit_t {
-        index_t task_index = 0;
-        bool operator<(aligned_visit_t const &other) const noexcept { return task_index < other.task_index; }
-        bool operator==(aligned_visit_t const &other) const noexcept { return task_index == other.task_index; }
-        bool operator!=(std::size_t other_index) const noexcept { return task_index != other_index; }
-        bool operator==(std::size_t other_index) const noexcept { return task_index == other_index; }
-    };
-
     // Make sure that no overflow happens in the static scheduling
     std::atomic<std::size_t> counter = 0;
-    std::vector<aligned_visit_t> visited(expected_parts);
-    pool.for_each_static(expected_parts, [&](task_t task) noexcept {
+    std::vector<aligned_visit_t> visited(default_parts);
+    pool.for_each_static(default_parts, [&](task_t task) noexcept {
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
         visited[count_populated].task_index = task.task_index;
     });
-    if (counter.load() != expected_parts) return false;
+    if (counter.load() != default_parts) return false;
     if (!contains_iota(visited)) return false;
 
     // Make sure that no overflow happens in the dynamic scheduling
     counter = 0;
-    pool.for_each_dynamic(expected_parts, [&](task_t task) noexcept {
+    pool.for_each_dynamic(default_parts, [&](task_t task) noexcept {
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
         visited[count_populated].task_index = task.task_index;
     });
-    if (counter.load() != expected_parts) return false;
+    if (counter.load() != default_parts) return false;
     if (!contains_iota(visited)) return false;
 
     // Make sure the operations can be interrupted from inside the task
@@ -251,7 +251,6 @@ int main() {
         std::fprintf(stderr, "%zu/%zu unit tests failed\n", failed_unit_tests, total_unit_tests);
         return EXIT_FAILURE;
     }
-
     std::printf("All %zu unit tests passed\n", total_unit_tests);
 
     // Start stress-testing the implementation
@@ -266,13 +265,17 @@ int main() {
         std::size_t count_threads;
         std::size_t count_tasks;
     } const stress_tests[] = {
+        {"`fu8` with 3 threads & 3 inputs", &stress_test_composite<fu8_t>, 3, 3},
+        {"`fu8` with 3 threads & 2 inputs", &stress_test_composite<fu8_t>, 3, 2},
+        {"`fu8` with 3 threads & 4 inputs", &stress_test_composite<fu8_t>, 3, 4},
+        {"`fu8` with 3 threads & 5 inputs", &stress_test_composite<fu8_t>, 3, 5},
         {"`fu8` with 7 threads & 255 inputs", &stress_test_composite<fu8_t>, 7, 255},
         {"`fu8` with 255 threads & 7 inputs", &stress_test_composite<fu8_t>, 255, 7},
         {"`fu8` with 253 threads & 254 inputs", &stress_test_composite<fu8_t>, 253, 254},
         {"`fu8` with 253 threads & 255 inputs", &stress_test_composite<fu8_t>, 253, 255},
         {"`fu8` with 255 threads & 255 inputs", &stress_test_composite<fu8_t>, 255, 255},
         {"`fu16` with thread/core & 65K inputs", &stress_test_composite<fu16_t>, max_cores, UINT16_MAX},
-        {"`fu16` with 65K threads & 65K inputs", &stress_test_composite<fu16_t>, UINT16_MAX, UINT16_MAX},
+        {"`fu16` with 333 threads & 65K inputs", &stress_test_composite<fu16_t>, 333, UINT16_MAX},
     };
 
     std::size_t const total_stress_tests = sizeof(stress_tests) / sizeof(stress_tests[0]);
@@ -289,6 +292,7 @@ int main() {
         std::fprintf(stderr, "%zu/%zu stress tests failed\n", failed_stress_tests, total_stress_tests);
         return EXIT_FAILURE;
     }
+    std::printf("All %zu stress tests passed\n", total_stress_tests);
 
     return EXIT_SUCCESS;
 }

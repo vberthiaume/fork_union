@@ -288,9 +288,9 @@ class fork_union {
             task_index_t const begin_lower_bound = n_per_thread_lower_bound * thread_index; // ? Handled overflow
             bool const begin_overflows = begin_lower_bound > begin;
             bool const begin_exceeds_n = begin >= n;
-            if (begin_overflows || begin_exceeds_n) return;
-            task_index_t const count = (std::min<task_index_t>)(add_sat(begin, n_per_thread), n) - begin;
-            function(task_t {thread_index, begin}, count);
+            task_index_t const capped_begin = (begin_overflows || begin_exceeds_n) ? n : begin;
+            task_index_t const count = (std::min<task_index_t>)(add_sat(capped_begin, n_per_thread), n) - capped_begin;
+            function(task_t {thread_index, capped_begin}, count);
         });
     }
 
@@ -315,7 +315,7 @@ class fork_union {
         task_parts_remaining_.store(total_threads_ - 1, std::memory_order_relaxed);
         task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
-        // Execute on the current thread
+        // Execute on the current "main" thread
         function(0);
 
         // Wait until all threads are done
@@ -351,7 +351,13 @@ class fork_union {
         if (n == 0) return;
         if (n == 1) return function(task_t {0, 0});
 
+        // If there are fewer tasks than threads, each thread gets at most 1 task
+        // and that's easier to schedule statically!
+        task_index_t const min_static_suffix_size = total_threads_;
+        if (n <= min_static_suffix_size) return for_each_static(n, function);
+
         // Store closure address
+        task_index_t const n_without_suffix = n - min_static_suffix_size;
         task_lambda_pointer_ = std::addressof(function);
         task_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
         task_parts_count_ = n;
@@ -359,8 +365,13 @@ class fork_union {
         task_parts_remaining_.store(n, std::memory_order_relaxed);
         task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
-        // Execute on the current thread
-        _worker_loop_for_dynamic_tasks(0, n);
+        // Execute on the current "main" thread, assuming the last `total_threads_ + 1` will
+        // be handled separately to avoid overflow in the dynamic worker loop. In that case,
+        // each can over-increment by one and we will still have the `SIZE_MAX` available
+        // for comparison.
+        task_trampoline_pointer_(task_lambda_pointer_, {0, n_without_suffix});
+        task_parts_remaining_.fetch_sub(1, std::memory_order_release);
+        _worker_loop_for_dynamic_tasks(0, n_without_suffix);
 
         // We may be in the in-flight position, where the current thread is already receiving
         // tasks beyond the `task_parts_count_` index, but the worker threads are still executing
@@ -395,6 +406,7 @@ class fork_union {
      */
     void _worker_loop(thread_index_t const thread_index) noexcept {
         generation_index_t last_task_generation = 0;
+        assert(thread_index != 0 && "The zero index is for the main thread, not worker!");
 
         while (true) {
             // Wait for either: a new ticket or a stop flag
@@ -409,22 +421,33 @@ class fork_union {
             // Check if we are operating in the "dynamic" eager mode or a balanced "static" mode
             task_index_t const task_parts_count = task_parts_count_;
             bool const is_static = task_parts_count == total_threads_;
-            if (is_static && task_parts_count) {
+            if (is_static) {
                 task_trampoline_pointer_(task_lambda_pointer_, {thread_index, thread_index});
                 // ! The decrement must come after the task is executed
                 _FU_MAYBE_UNUSED task_index_t const before_decrement =
-                    task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
+                    task_parts_remaining_.fetch_sub(1, std::memory_order_release);
                 assert(before_decrement > 0 && "We can't be here if there are no worker threads");
             }
-            else { _worker_loop_for_dynamic_tasks(thread_index, task_parts_count); }
+            else {
+                // Execute one task per thread separately to avoid possible overflow in the dynamic worker loop
+                task_index_t const n_without_suffix = task_parts_count - total_threads_;
+                task_trampoline_pointer_(task_lambda_pointer_, {thread_index, n_without_suffix + thread_index});
+                task_parts_remaining_.fetch_sub(1, std::memory_order_release);
+                _worker_loop_for_dynamic_tasks(thread_index, n_without_suffix);
+            }
             last_task_generation = new_task_generation;
         }
     }
 
     void _worker_loop_for_dynamic_tasks(task_index_t const thread_index, task_index_t const task_parts_count) noexcept {
 
-        // Track last executed task for the `beyond_task_and_overflow` condition.
-        task_index_t last_executed_task_in_this_thread = 0;
+        // If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
+        // of computational time we will wrap around the `std::size_t` capacity for the `new_task_index`.
+        // In case we `task_parts_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
+        // Alternatively, we can make sure, that each thread can do at least one increment of `task_parts_passed_`
+        // without worrying about the overflow. The way to achieve that is to preprocess the trailing `total_threads_`
+        // of elements externally, before entering this loop!
+        assert((task_parts_count + total_threads_) >= task_parts_count);
 
         // Unlike the thread-balanced mode, we need to keep track of the number of passed tasks.
         // The traditional way to achieve that is to use the same single atomic `task_parts_remaining_`
@@ -438,17 +461,11 @@ class fork_union {
             bool const beyond_last_task = new_task_index >= task_parts_count;
             if (beyond_last_task) break;
 
-            // If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
-            // of computational time we will wrap around the `std::size_t` capacity for the `new_task_index`.
-            // In case we `task_parts_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
-            bool const beyond_task_and_overflow = new_task_index < last_executed_task_in_this_thread;
-            if (beyond_task_and_overflow) [[unlikely]]
-                break;
-
             task_trampoline_pointer_(task_lambda_pointer_, {thread_index, new_task_index});
-            // ! The decrement must come after the task is executed
+            // ! The decrement must come after the task is executed, as our main thread is waiting
+            // ! for that counter to reach zero, to exit the current scope.
             _FU_MAYBE_UNUSED task_index_t const before_decrement =
-                task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
+                task_parts_remaining_.fetch_sub(1, std::memory_order_release);
             assert(before_decrement > 0 && "We can't be here if there are no tasks left");
             last_executed_task_in_this_thread = new_task_index;
         }
