@@ -7,13 +7,6 @@
 
 namespace fun = ashvardanian::fork_union;
 
-using test_func_t = bool() noexcept;
-
-struct test_t {
-    char const *name;
-    test_func_t *function;
-};
-
 static bool test_try_spawn_success() noexcept {
     fun::fork_union_t pool;
     auto const count_threads = std::thread::hardware_concurrency();
@@ -58,28 +51,43 @@ static bool test_uncomfortable_input_size() noexcept {
     return true;
 }
 
+template <typename scalar_type_>
+static bool contains_iota(std::vector<scalar_type_> &visited) noexcept {
+    std::sort(visited.begin(), visited.end());
+    for (std::size_t i = 0; i < visited.size(); ++i)
+        if (visited[i] != i) return false;
+    return true;
+}
+
 /** @brief Make sure that `for_each_static` is called the right number of times with the right task IDs. */
 static bool test_for_each_static() noexcept {
     constexpr std::size_t expected_parts = 10'000'000;
 
     std::vector<std::size_t> visited(expected_parts, 0);
     std::atomic<std::size_t> counter = 0;
-    {
-        fun::fork_union_t pool;
-        auto const count_threads = std::thread::hardware_concurrency();
-        if (!pool.try_spawn(count_threads)) return false;
-        pool.for_each_static(expected_parts, [&](std::size_t const task_index) noexcept {
-            // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
-            std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-            visited[count_populated] = task_index;
-        });
-    }
+
+    fun::fork_union_t pool;
+    auto const count_threads = std::thread::hardware_concurrency();
+    if (!pool.try_spawn(count_threads)) return false;
+    pool.for_each_static(expected_parts, [&](std::size_t const task_index) noexcept {
+        // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+        std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
+        visited[count_populated] = task_index;
+    });
 
     // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
-    std::sort(visited.begin(), visited.end());
-    return counter.load() == expected_parts && std::adjacent_find(visited.begin(), visited.end()) == visited.end() &&
-           std::is_sorted(visited.begin(), visited.end()) && visited.front() == (0) &&
-           visited.back() == (expected_parts - 1);
+    if (counter.load() != expected_parts) return false;
+    if (!contains_iota(visited)) return false;
+
+    // Make sure repeated calls to `for_each_static` work
+    counter = 0;
+    pool.for_each_static(expected_parts, [&](std::size_t const task_index) noexcept {
+        // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+        std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
+        visited[count_populated] = task_index;
+    });
+
+    return counter.load() == expected_parts && contains_iota(visited);
 }
 
 /** @brief Make sure that `for_each_dynamic` is called the right number of times with the right task IDs. */
@@ -98,10 +106,18 @@ static bool test_for_each_dynamic() noexcept {
     });
 
     // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
-    std::sort(visited.begin(), visited.end());
-    return counter.load() == expected_parts && std::adjacent_find(visited.begin(), visited.end()) == visited.end() &&
-           std::is_sorted(visited.begin(), visited.end()) && visited.front() == (0) &&
-           visited.back() == (expected_parts - 1);
+    if (counter.load() != expected_parts) return false;
+    if (!contains_iota(visited)) return false;
+
+    // Make sure repeated calls to `for_each_static` work
+    counter = 0;
+    pool.for_each_dynamic(expected_parts, [&](std::size_t const task_index) noexcept {
+        // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+        std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
+        visited[count_populated] = task_index;
+    });
+
+    return counter.load() == expected_parts && contains_iota(visited);
 }
 
 /** @brief Stress-tests the implementation by oversubscribing the number of threads. */
@@ -125,10 +141,7 @@ static bool test_oversubscribed_unbalanced_threads() noexcept {
     });
 
     // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
-    std::sort(visited.begin(), visited.end());
-    return counter.load() == expected_parts && std::adjacent_find(visited.begin(), visited.end()) == visited.end() &&
-           std::is_sorted(visited.begin(), visited.end()) && visited.front() == (0) &&
-           visited.back() == (expected_parts - 1);
+    return counter.load() == expected_parts && contains_iota(visited);
 }
 
 struct c_function_context_t {
@@ -158,14 +171,62 @@ static bool test_c_function_pointers() noexcept {
     pool.for_each_dynamic(expected_parts, fun::fork_union_t::c_callback_t {&_handle_one_task, &context});
 
     // Make sure that all task IDs are unique and form the full range of [0, `expected_parts`).
-    std::sort(visited.begin(), visited.end());
-    return counter.load() == expected_parts && std::adjacent_find(visited.begin(), visited.end()) == visited.end() &&
-           std::is_sorted(visited.begin(), visited.end()) && visited.front() == (0) &&
-           visited.back() == (expected_parts - 1);
+    return counter.load() == expected_parts && contains_iota(visited);
+}
+
+/** @brief Hard complex example, involving launching multiple tasks, including static and dynamic ones,
+ *         stopping them half-way, resetting & reinitializing, and raising exceptions.
+ */
+template <typename pool_type_>
+static bool stress_test_composite(std::size_t const thread_count, std::size_t const expected_parts) noexcept {
+
+    using pool_t = pool_type_;
+    using index_t = typename pool_t::index_t;
+    using task_t = typename pool_t::task_t;
+
+    pool_t pool;
+    if (!pool.try_spawn(thread_count)) return false;
+
+    struct alignas(fun::default_alignment_k) aligned_visit_t {
+        index_t task_index = 0;
+        bool operator<(aligned_visit_t const &other) const noexcept { return task_index < other.task_index; }
+        bool operator==(aligned_visit_t const &other) const noexcept { return task_index == other.task_index; }
+        bool operator!=(std::size_t other_index) const noexcept { return task_index != other_index; }
+        bool operator==(std::size_t other_index) const noexcept { return task_index == other_index; }
+    };
+
+    // Make sure that no overflow happens in the static scheduling
+    std::atomic<std::size_t> counter = 0;
+    std::vector<aligned_visit_t> visited(expected_parts);
+    pool.for_each_static(expected_parts, [&](task_t task) noexcept {
+        // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+        std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
+        visited[count_populated].task_index = task.task_index;
+    });
+    if (counter.load() != expected_parts) return false;
+    if (!contains_iota(visited)) return false;
+
+    // Make sure that no overflow happens in the dynamic scheduling
+    counter = 0;
+    pool.for_each_dynamic(expected_parts, [&](task_t task) noexcept {
+        // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+        std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
+        visited[count_populated].task_index = task.task_index;
+    });
+    if (counter.load() != expected_parts) return false;
+    if (!contains_iota(visited)) return false;
+
+    // Make sure the operations can be interrupted from inside the task
+    return true;
 }
 
 int main() {
-    test_t const tests[] = {
+
+    using test_func_t = bool() noexcept;
+    struct {
+        char const *name;
+        test_func_t *function;
+    } const unit_tests[] = {
         {"`try_spawn` normal", test_try_spawn_success},                                        //
         {"`try_spawn` zero threads", test_try_spawn_zero},                                     //
         {"`for_each_thread` dispatch", test_for_each_thread},                                  //
@@ -176,21 +237,58 @@ int main() {
         {"`for_each_dynamic` with C function pointers", test_c_function_pointers},             //
     };
 
-    std::size_t const total = sizeof(tests) / sizeof(tests[0]);
-    std::size_t failed = 0;
-    for (std::size_t i = 0; i < total; ++i) {
-        std::printf("Running %s... ", tests[i].name);
-        bool const ok = tests[i].function();
+    std::size_t const total_unit_tests = sizeof(unit_tests) / sizeof(unit_tests[0]);
+    std::size_t failed_unit_tests = 0;
+    for (std::size_t i = 0; i < total_unit_tests; ++i) {
+        std::printf("Running %s... ", unit_tests[i].name);
+        bool const ok = unit_tests[i].function();
         if (ok) { std::printf("PASS\n"); }
         else { std::printf("FAIL\n"); }
-        failed += !ok;
+        failed_unit_tests += !ok;
     }
 
-    if (failed > 0) {
-        std::fprintf(stderr, "%zu/%zu tests failed\n", failed, total);
+    if (failed_unit_tests > 0) {
+        std::fprintf(stderr, "%zu/%zu unit tests failed\n", failed_unit_tests, total_unit_tests);
         return EXIT_FAILURE;
     }
 
-    std::printf("All %zu tests passed\n", total);
+    std::printf("All %zu unit tests passed\n", total_unit_tests);
+
+    // Start stress-testing the implementation
+    std::size_t const max_cores = std::thread::hardware_concurrency();
+    using fu32_t = fun::fork_union<std::allocator<std::thread>, std::uint32_t>;
+    using fu16_t = fun::fork_union<std::allocator<std::thread>, std::uint16_t>;
+    using fu8_t = fun::fork_union<std::allocator<std::thread>, std::uint8_t>;
+    using stress_test_func_t = bool(std::size_t, std::size_t) noexcept;
+    struct {
+        char const *name;
+        stress_test_func_t *function;
+        std::size_t count_threads;
+        std::size_t count_tasks;
+    } const stress_tests[] = {
+        {"`fu8` with 7 threads & 255 inputs", &stress_test_composite<fu8_t>, 7, 255},
+        {"`fu8` with 255 threads & 7 inputs", &stress_test_composite<fu8_t>, 255, 7},
+        {"`fu8` with 253 threads & 254 inputs", &stress_test_composite<fu8_t>, 253, 254},
+        {"`fu8` with 253 threads & 255 inputs", &stress_test_composite<fu8_t>, 253, 255},
+        {"`fu8` with 255 threads & 255 inputs", &stress_test_composite<fu8_t>, 255, 255},
+        {"`fu16` with thread/core & 65K inputs", &stress_test_composite<fu16_t>, max_cores, UINT16_MAX},
+        {"`fu16` with 65K threads & 65K inputs", &stress_test_composite<fu16_t>, UINT16_MAX, UINT16_MAX},
+    };
+
+    std::size_t const total_stress_tests = sizeof(stress_tests) / sizeof(stress_tests[0]);
+    std::size_t failed_stress_tests = 0;
+    for (std::size_t i = 0; i < total_stress_tests; ++i) {
+        std::printf("Running %s... ", stress_tests[i].name);
+        bool const ok = stress_tests[i].function(stress_tests[i].count_threads, stress_tests[i].count_tasks);
+        if (ok) { std::printf("PASS\n"); }
+        else { std::printf("FAIL\n"); }
+        failed_stress_tests += !ok;
+    }
+
+    if (failed_stress_tests > 0) {
+        std::fprintf(stderr, "%zu/%zu stress tests failed\n", failed_stress_tests, total_stress_tests);
+        return EXIT_FAILURE;
+    }
+
     return EXIT_SUCCESS;
 }
