@@ -67,7 +67,8 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
 }
 
 /**
- *  @brief Minimalistic STL-based non-resizable thread-pool for simultaneous blocking tasks.
+ *  @brief  Minimalistic STL-based non-resizable thread-pool for simultaneous blocking tasks.
+ *          "Fork" many threads, enumerate the "prongs" of the "fork", and "join" them back :)
  *
  *  Fork Union supports 2 modes of operation: static and dynamic. Static mode is designed
  *  for balanced workloads, taking roughly the same amount of time to execute on each thread.
@@ -91,6 +92,10 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *  use the "acquire-release" model, and some going further to "relaxed" model.
  *  @see https://en.cppreference.com/w/cpp/atomic/memory_order#Release-Acquire_ordering
  *
+ *  @section Usage
+ *
+ *  A minimal example, similar to `#pragma omp parallel` in OpenMP:
+ *
  *  @code{.cpp}
  *  #include <cstdio> // `std::printf`
  *  #include <cstdlib> // `EXIT_FAILURE`, `EXIT_SUCCESS`
@@ -101,6 +106,30 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *      fun::fork_union<> pool;
  *      if (!pool.try_spawn(std::thread::hardware_concurrency())) return EXIT_FAILURE;
  *      pool.for_each_thread([](std::size_t index) { std::printf("Hello from thread %zu\n", index); });
+ *      return EXIT_SUCCESS;
+ *  }
+ *  @endcode
+ *
+ *  User callbacks in a simple case receive just a single integer identifying the part
+ *  of the task to be executed. For more advanced use-cases, when the user needs to know
+ *  the thread ID (likely to use some thread-local storage), the callbacks should receive
+ *  a `prong_t` argument, and unpack the thread ID from it.
+ *
+ *  @code{.cpp}
+ *  #include <cstdio> // `std::printf`
+ *  #include <cstdlib> // `EXIT_FAILURE`, `EXIT_SUCCESS`
+ *  #include <fork_union.hpp>
+ *
+ *  using fun = ashvardanian::fork_union;
+ *  int main() {
+ *      fun::fork_union<> pool;
+ *      if (!pool.try_spawn(std::thread::hardware_concurrency()))
+ *          return EXIT_FAILURE;
+ *
+ *      pool.for_each_slice([](auto prong) {
+ *          auto const [thread_index, task_index] = prong;
+ *          std::printf("Executing task %zu on core %zu\n", task_index, thread_index);
+ *      });
  *      return EXIT_SUCCESS;
  *  }
  *  @endcode
@@ -123,48 +152,43 @@ class fork_union {
     static_assert(alignment_k > 0 && (alignment_k & (alignment_k - 1)) == 0, "Alignment must be a power of 2");
 
     using thread_index_t = index_t;
-    using task_index_t = index_t;
+    using prong_index_t = index_t;
     using generation_index_t = index_t;
 
     /**
      *  @brief A POD-type describing a certain part of a parallel task.
-     *
-     *  User callbacks in a simple case receive just a single integer identifying the part
-     *  of the task to be executed. For more advanced use-cases, when the user needs to know
-     *  the thread ID (likely to use some thread-local storage), the callbacks should receive
-     *  a `task_t` argument, and unpack the thread ID from it.
      */
-    struct task_t {
+    struct prong_t {
         thread_index_t thread_index {0};
-        task_index_t task_index {0};
+        prong_index_t prong_index {0};
 
-        inline operator task_index_t() const noexcept { return task_index; }
+        inline operator prong_index_t() const noexcept { return prong_index; }
     };
 
-    using punned_task_context_t = void const *;
-    using trampoline_pointer_t = void (*)(punned_task_context_t, task_t);
+    using punned_fork_context_t = void const *;
+    using trampoline_pointer_t = void (*)(punned_fork_context_t, prong_t);
 
     struct c_callback_t {
         trampoline_pointer_t callable {nullptr};
-        punned_task_context_t context {nullptr};
+        punned_fork_context_t context {nullptr};
 
-        inline void operator()(task_t task) const noexcept { callable(context, task); }
+        inline void operator()(prong_t prong) const noexcept { callable(context, prong); }
     };
 
   private:
     // Thread-pool-specific variables:
     allocator_t allocator_ {};
     std::thread *workers_ {nullptr};
-    thread_index_t total_threads_ {0};
+    thread_index_t threads_count_ {0};
     alignas(alignment_) std::atomic<bool> stop_ {false};
 
     // Task-specific variables:
-    punned_task_context_t task_lambda_pointer_ {nullptr};    // ? Pointer to the users lambda
-    trampoline_pointer_t task_trampoline_pointer_ {nullptr}; // ? Calls the lambda
-    task_index_t task_parts_count_ {0};
-    alignas(alignment_) std::atomic<task_index_t> task_parts_remaining_ {0};
-    alignas(alignment_) std::atomic<task_index_t> task_parts_passed_ {0}; // ? Only used in dynamic mode
-    alignas(alignment_) std::atomic<generation_index_t> task_generation_ {0};
+    punned_fork_context_t fork_lambda_pointer_ {nullptr};    // ? Pointer to the users lambda
+    trampoline_pointer_t fork_trampoline_pointer_ {nullptr}; // ? Calls the lambda
+    prong_index_t prongs_count_ {0};
+    alignas(alignment_) std::atomic<prong_index_t> prongs_remaining_ {0};
+    alignas(alignment_) std::atomic<prong_index_t> prongs_passed_ {0}; // ? Only used in dynamic mode
+    alignas(alignment_) std::atomic<generation_index_t> fork_generation_ {0};
 
   public:
     fork_union(fork_union &&) = delete;
@@ -174,7 +198,7 @@ class fork_union {
 
     fork_union(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
     ~fork_union() noexcept { stop_and_reset(); }
-    thread_index_t thread_count() const noexcept { return total_threads_; }
+    thread_index_t threads_count() const noexcept { return threads_count_; }
 
     /**
      *  @brief Creates a thread-pool with the given number of threads.
@@ -183,10 +207,10 @@ class fork_union {
      *  @retval false if the number of threads is zero or the "workers" allocation failed.
      *  @retval true if the thread-pool was created successfully, started, and is ready to use.
      */
-    bool try_spawn(std::size_t const planned_threads) noexcept {
+    bool try_spawn(thread_index_t const planned_threads) noexcept {
         if (planned_threads == 0) return false; // ! Can't have zero threads working on something
         if (planned_threads == 1) return true;  // ! The current thread will always be used
-        if (total_threads_ != 0) return false;  // ! Already initialized
+        if (threads_count_ != 0) return false;  // ! Already initialized
 
         // Allocate the thread pool
         thread_index_t const worker_threads = planned_threads - 1;
@@ -209,7 +233,7 @@ class fork_union {
 
         // If all went well, we can store the thread-pool and start using it
         workers_ = workers;
-        total_threads_ = planned_threads;
+        threads_count_ = planned_threads;
         return true;
     }
 
@@ -218,15 +242,15 @@ class fork_union {
      *  @note Can't be called while any tasks are running.
      */
     void stop_and_reset() noexcept {
-        if (total_threads_ == 0) return;                                    // ? Uninitialized
-        if (total_threads_ == 1) return;                                    // ? No worker threads to join
-        assert(task_parts_remaining_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
+        if (threads_count_ == 0) return;                                // ? Uninitialized
+        if (threads_count_ == 1) return;                                // ? No worker threads to join
+        assert(prongs_remaining_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
 
         // Stop all threads and wait for them to finish
-        _reset_task();
+        _reset_fork_description();
         stop_.store(true, std::memory_order_release);
 
-        thread_index_t const worker_threads = total_threads_ - 1;
+        thread_index_t const worker_threads = threads_count_ - 1;
         for (thread_index_t i = 0; i != worker_threads; ++i) {
             workers_[i].join();    // ? Wait for the thread to finish
             workers_[i].~thread(); // ? Call destructor
@@ -236,16 +260,16 @@ class fork_union {
         allocator_.deallocate(workers_, worker_threads);
 
         // Prepare for future spawns
-        total_threads_ = 0;
+        threads_count_ = 0;
         workers_ = nullptr;
         stop_.store(false, std::memory_order_relaxed);
-        task_generation_.store(0, std::memory_order_relaxed);
+        fork_generation_.store(0, std::memory_order_relaxed);
     }
 
     /**
-     *  @brief Distributes @p (n) similar tasks into between threads.
+     *  @brief Distributes @p (n) similar duration calls between threads.
      *  @param[in] n The number of times to call the @p function.
-     *  @param[in] function The callback, receiving @b `task_t` or the task index as an argument.
+     *  @param[in] function The callback, receiving @b `prong_t` or a call index as an argument.
      *
      *  Is designed for a "balanced" workload, where all threads have roughly the same amount of work.
      *  @sa `for_each_dynamic` for a more dynamic workload.
@@ -253,63 +277,63 @@ class fork_union {
      *  @sa `for_each_slice` if you prefer to receive workload slices over individual indices.
      */
     template <typename function_type_>
-    void for_each_static(task_index_t const n, function_type_ const &function) noexcept {
+    void for_each_static(prong_index_t const n, function_type_ const &function) noexcept {
 
 #if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
-        static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t>::value ||
-                       std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value),
-                      "The callback must be invocable with a `task_t` or a `task_index_t` argument");
+        static_assert((std::is_nothrow_invocable_r<void, function_type_, prong_t>::value ||
+                       std::is_nothrow_invocable_r<void, function_type_, prong_index_t>::value),
+                      "The callback must be invocable with a `prong_t` or a `prong_index_t` argument");
 #endif
 
-        for_each_slice(n, [function](task_t start_task, task_index_t count) noexcept {
-            for (task_index_t i = 0; i < count; ++i)
-                function(task_t {start_task.thread_index, static_cast<task_index_t>(start_task.task_index + i)});
+        for_each_slice(n, [function](prong_t start_task, prong_index_t count) noexcept {
+            for (prong_index_t i = 0; i < count; ++i)
+                function(prong_t {start_task.thread_index, static_cast<prong_index_t>(start_task.prong_index + i)});
         });
     }
 
     /**
-     *  @brief Splits a range of @p (n) tasks into consecutive chunks for each thread.
+     *  @brief Distributes @p (n) similar duration calls between threads in slices, as opposed to individual indices.
      *  @param[in] n The total length of the range to split between threads.
-     *  @param[in] function The callback, receiving @b `task_t` or an unsigned integer and the slice length.
+     *  @param[in] function The callback, receiving @b `prong_t` or an unsigned integer and the slice length.
      */
     template <typename function_type_>
-    void for_each_slice(task_index_t const n, function_type_ const &function) noexcept {
+    void for_each_slice(prong_index_t const n, function_type_ const &function) noexcept {
 
 #if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
         static_assert(
-            (std::is_nothrow_invocable_r<void, function_type_, task_t, task_index_t>::value ||
-             std::is_nothrow_invocable_r<void, function_type_, task_index_t, task_index_t>::value),
-            "The callback must be invocable with a `task_t` or a `task_index_t` argument and an unsigned counter");
+            (std::is_nothrow_invocable_r<void, function_type_, prong_t, prong_index_t>::value ||
+             std::is_nothrow_invocable_r<void, function_type_, prong_index_t, prong_index_t>::value),
+            "The callback must be invocable with a `prong_t` or a `prong_index_t` argument and an unsigned counter");
 #endif
 
         // No need to slice the workload if we only have one thread
-        assert(total_threads_ != 0 && "Thread pool not initialized");
-        if (total_threads_ == 1 || n == 1) return function(task_t {0, 0}, n);
+        assert(threads_count_ != 0 && "Thread pool not initialized");
+        if (threads_count_ == 1 || n == 1) return function(prong_t {0, 0}, n);
         if (n == 0) return;
 
         // Divide and round-up the workload size per thread - assuming some fuzzer may
         // pass an absurdly large `n` as an input, the addition may overflow,
-        // so `(n + total_threads_ - 1) / total_threads_` is not the safest option.
-        // Instead, we can do: `n / total_threads_ + (n % total_threads_ != 0)`,
+        // so `(n + threads_count_ - 1) / threads_count_` is not the safest option.
+        // Instead, we can do: `n / threads_count_ + (n % threads_count_ != 0)`,
         // but avoiding the cost of the second integer division, replacing it with multiplication.
-        task_index_t const n_per_thread_lower_bound = n / total_threads_;
-        task_index_t const n_per_thread = n_per_thread_lower_bound + ((n_per_thread_lower_bound * total_threads_) < n);
+        prong_index_t const n_per_thread_lower_bound = n / threads_count_;
+        prong_index_t const n_per_thread = n_per_thread_lower_bound + ((n_per_thread_lower_bound * threads_count_) < n);
         for_each_thread([n, n_per_thread, n_per_thread_lower_bound, function](thread_index_t thread_index) noexcept {
-            // Multiplying `thread_index` by `n_per_thread` may overflow. For an 8-bit `task_index_t` type:
+            // Multiplying `thread_index` by `n_per_thread` may overflow. For an 8-bit `prong_index_t` type:
             // - 254 threads,
             // - 255 tasks,
             // - each thread gets 1 or 2 tasks
             // In that case, both `begin` and `begin_lower_bound` will overflow, but we can use
             // their relative values to determine the real slice length for the thread.
-            task_index_t const begin = thread_index * n_per_thread;                         // ? Handled overflow
-            task_index_t const begin_lower_bound = n_per_thread_lower_bound * thread_index; // ? Handled overflow
+            prong_index_t const begin = thread_index * n_per_thread;                         // ? Handled overflow
+            prong_index_t const begin_lower_bound = n_per_thread_lower_bound * thread_index; // ? Handled overflow
             bool const begin_overflows = begin_lower_bound > begin;
             bool const begin_exceeds_n = begin >= n;
-            task_index_t const capped_begin = (begin_overflows || begin_exceeds_n) ? n : begin;
-            task_index_t const count = (std::min<task_index_t>)(add_sat(capped_begin, n_per_thread), n) - capped_begin;
-            function(task_t {thread_index, capped_begin}, count);
+            if (begin_overflows || begin_exceeds_n) return;
+            prong_index_t const count = (std::min<prong_index_t>)(add_sat(begin, n_per_thread), n) - begin;
+            function(prong_t {thread_index, begin}, count);
         });
     }
 
@@ -319,102 +343,102 @@ class fork_union {
      */
     template <typename function_type_>
     void for_each_thread(function_type_ const &function) noexcept {
-        if (total_threads_ == 1) return function(0);
+        if (threads_count_ == 1) return function(0);
 
 #if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
-        static_assert(std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value,
-                      "The callback must be invocable with a `task_index_t` argument");
+        static_assert(std::is_nothrow_invocable_r<void, function_type_, prong_index_t>::value,
+                      "The callback must be invocable with a `prong_index_t` argument");
 #endif
 
-        // Store closure address
-        task_lambda_pointer_ = std::addressof(function);
-        task_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
-        task_parts_count_ = total_threads_;
-        task_parts_remaining_.store(total_threads_ - 1, std::memory_order_relaxed);
-        task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
+        // Configure "fork" details
+        fork_lambda_pointer_ = std::addressof(function);
+        fork_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
+        prongs_count_ = threads_count_;
+        prongs_remaining_.store(threads_count_ - 1, std::memory_order_relaxed);
+        fork_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current "main" thread
         function(0);
 
         // Wait until all threads are done
-        while (task_parts_remaining_.load(std::memory_order_acquire)) std::this_thread::yield();
+        while (prongs_remaining_.load(std::memory_order_acquire)) std::this_thread::yield();
 
         // An optional reset of the task variables for debuggability
-        _reset_task();
+        _reset_fork_description();
     }
 
     /**
      *  @brief Executes uneven tasks on all threads, greedying for work.
      *  @param[in] n The number of times to call the @p function.
-     *  @param[in] function The callback, receiving the `task_t` or the task index as an argument.
+     *  @param[in] function The callback, receiving the `prong_t` or the task index as an argument.
      *  @sa `for_each_static` for a more "balanced" evenly-splittable workload.
      */
     template <typename function_type_>
-    void for_each_dynamic(task_index_t const n, function_type_ const &function) noexcept {
+    void for_each_dynamic(prong_index_t const n, function_type_ const &function) noexcept {
 
 #if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
-        static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t>::value ||
-                       std::is_nothrow_invocable_r<void, function_type_, task_index_t>::value),
-                      "The callback must be invocable with a `task_t` or a `task_index_t` argument");
+        static_assert((std::is_nothrow_invocable_r<void, function_type_, prong_t>::value ||
+                       std::is_nothrow_invocable_r<void, function_type_, prong_index_t>::value),
+                      "The callback must be invocable with a `prong_t` or a `prong_index_t` argument");
 #endif
 
         // If there is just one thread, all work is done on the current thread
-        if (total_threads_ == 1) {
-            for (task_index_t i = 0; i < n; ++i) function(task_t {0, i});
+        if (threads_count_ == 1) {
+            for (prong_index_t i = 0; i < n; ++i) function(prong_t {0, i});
             return;
         }
 
         // No need to slice the work if there is just one task
         if (n == 0) return;
-        if (n == 1) return function(task_t {0, 0});
+        if (n == 1) return function(prong_t {0, 0});
 
         // If there are fewer tasks than threads, each thread gets at most 1 task
         // and that's easier to schedule statically!
-        task_index_t const min_static_suffix_size = total_threads_;
+        prong_index_t const min_static_suffix_size = threads_count_;
         if (n <= min_static_suffix_size) return for_each_static(n, function);
 
-        // Store closure address
-        task_index_t const n_without_suffix = n - min_static_suffix_size;
-        task_lambda_pointer_ = std::addressof(function);
-        task_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
-        task_parts_count_ = n;
-        task_parts_passed_.store(0, std::memory_order_relaxed);
-        task_parts_remaining_.store(n, std::memory_order_relaxed);
-        task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
+        // Configure "fork" details
+        prong_index_t const n_without_suffix = n - min_static_suffix_size;
+        fork_lambda_pointer_ = std::addressof(function);
+        fork_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
+        prongs_count_ = n;
+        prongs_passed_.store(0, std::memory_order_relaxed);
+        prongs_remaining_.store(n, std::memory_order_relaxed);
+        fork_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
-        // Execute on the current "main" thread, assuming the last `total_threads_` will
+        // Execute on the current "main" thread, assuming the last `threads_count_` will
         // be handled separately to avoid overflow in the dynamic worker loop.
-        task_trampoline_pointer_(task_lambda_pointer_, {0, n_without_suffix});
-        task_parts_remaining_.fetch_sub(1, std::memory_order_release);
+        fork_trampoline_pointer_(fork_lambda_pointer_, {0, n_without_suffix});
+        prongs_remaining_.fetch_sub(1, std::memory_order_release);
         _worker_loop_for_dynamic_tasks(0, n_without_suffix);
 
         // We may be in the in-flight position, where the current thread is already receiving
-        // tasks beyond the `task_parts_count_` index, but the worker threads are still executing
-        // tasks and haven't decremented the `task_parts_remaining_` variable yet.
-        while (task_parts_remaining_.load(std::memory_order_acquire)) std::this_thread::yield();
+        // tasks beyond the `prongs_count_` index, but the worker threads are still executing
+        // tasks and haven't decremented the `prongs_remaining_` variable yet.
+        while (prongs_remaining_.load(std::memory_order_acquire)) std::this_thread::yield();
 
         // Optional reset of the task variables for debuggability
-        _reset_task();
+        _reset_fork_description();
     }
 
   private:
-    void _reset_task() noexcept {
-        task_parts_count_ = 0;
-        task_lambda_pointer_ = nullptr;
-        task_trampoline_pointer_ = nullptr;
+    void _reset_fork_description() noexcept {
+        prongs_count_ = 0;
+        fork_lambda_pointer_ = nullptr;
+        fork_trampoline_pointer_ = nullptr;
     }
 
     /**
      *  @brief A trampoline function that is used to call the user-defined lambda.
      *  @param[in] punned_lambda_pointer The pointer to the user-defined lambda.
-     *  @param[in] task The index of the thread & task packed together.
+     *  @param[in] prong The index of the thread & task index packed together.
      */
     template <typename function_type_>
-    static void _call_lambda_from_thread(punned_task_context_t punned_lambda_pointer, task_t task) noexcept {
+    static void _call_lambda_from_thread(punned_fork_context_t punned_lambda_pointer, prong_t prong) noexcept {
         auto const &lambda_object = *static_cast<function_type_ const *>(punned_lambda_pointer);
-        lambda_object(task);
+        lambda_object(prong);
     }
 
     /**
@@ -422,67 +446,67 @@ class fork_union {
      *  @param[in] thread_index The index of the thread that is executing this function.
      */
     void _worker_loop(thread_index_t const thread_index) noexcept {
-        generation_index_t last_task_generation = 0;
+        generation_index_t last_fork_generation = 0;
         assert(thread_index != 0 && "The zero index is for the main thread, not worker!");
 
         while (true) {
             // Wait for either: a new ticket or a stop flag
-            generation_index_t new_task_generation;
+            generation_index_t new_fork_generation;
             bool wants_to_stop;
-            while ((new_task_generation = task_generation_.load(std::memory_order_acquire)) == last_task_generation &&
+            while ((new_fork_generation = fork_generation_.load(std::memory_order_acquire)) == last_fork_generation &&
                    (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
                 std::this_thread::yield();
 
             if (wants_to_stop) return;
 
             // Check if we are operating in the "dynamic" eager mode or a balanced "static" mode
-            task_index_t const task_parts_count = task_parts_count_;
-            bool const is_static = task_parts_count == total_threads_;
+            prong_index_t const prongs_count = prongs_count_;
+            bool const is_static = prongs_count == threads_count_;
             if (is_static) {
-                task_trampoline_pointer_(task_lambda_pointer_, {thread_index, thread_index});
+                fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, thread_index});
                 // ! The decrement must come after the task is executed
-                _FU_MAYBE_UNUSED task_index_t const before_decrement =
-                    task_parts_remaining_.fetch_sub(1, std::memory_order_release);
+                _FU_MAYBE_UNUSED prong_index_t const before_decrement =
+                    prongs_remaining_.fetch_sub(1, std::memory_order_release);
                 assert(before_decrement > 0 && "We can't be here if there are no worker threads");
             }
             else {
                 // Execute one task per thread separately to avoid possible overflow in the dynamic worker loop
-                task_index_t const n_without_suffix = task_parts_count - total_threads_;
-                task_trampoline_pointer_(task_lambda_pointer_, {thread_index, n_without_suffix + thread_index});
-                task_parts_remaining_.fetch_sub(1, std::memory_order_release);
+                prong_index_t const n_without_suffix = prongs_count - threads_count_;
+                fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, n_without_suffix + thread_index});
+                prongs_remaining_.fetch_sub(1, std::memory_order_release);
                 _worker_loop_for_dynamic_tasks(thread_index, n_without_suffix);
             }
-            last_task_generation = new_task_generation;
+            last_fork_generation = new_fork_generation;
         }
     }
 
-    void _worker_loop_for_dynamic_tasks(task_index_t const thread_index, task_index_t const task_parts_count) noexcept {
+    void _worker_loop_for_dynamic_tasks(thread_index_t const thread_index, prong_index_t const prongs_count) noexcept {
 
         // If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
-        // of computational time we will wrap around the `std::size_t` capacity for the `new_task_index`.
-        // In case we `task_parts_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
-        // Alternatively, we can make sure, that each thread can do at least one increment of `task_parts_passed_`
-        // without worrying about the overflow. The way to achieve that is to preprocess the trailing `total_threads_`
+        // of computational time we will wrap around the `std::size_t` capacity for the `new_prong_index`.
+        // In case we `prongs_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
+        // Alternatively, we can make sure, that each thread can do at least one increment of `prongs_passed_`
+        // without worrying about the overflow. The way to achieve that is to preprocess the trailing `threads_count_`
         // of elements externally, before entering this loop!
-        assert((task_parts_count + total_threads_) >= task_parts_count);
+        assert((prongs_count + threads_count_) >= prongs_count); // ? Detects overflow
 
         // Unlike the thread-balanced mode, we need to keep track of the number of passed tasks.
-        // The traditional way to achieve that is to use the same single atomic `task_parts_remaining_`
+        // The traditional way to achieve that is to use the same single atomic `prongs_remaining_`
         // variable, but using `compare_exchange_weak` interfaces. It's much more expensive on modern
         // CPUs, so we use an additional atomic variable and have 2x atomic increments of 2x atomic variables,
         // instead of 1x atomic load and 1x atomic CAS on 1x atomic variable (in optimistic low-contention case).
         while (true) {
 
             // The relative order of executed tasks doesn't matter here, so we can use relaxed memory order.
-            task_index_t const new_task_index = task_parts_passed_.fetch_add(1, std::memory_order_relaxed);
-            bool const beyond_last_task = new_task_index >= task_parts_count;
-            if (beyond_last_task) break;
+            prong_index_t const new_prong_index = prongs_passed_.fetch_add(1, std::memory_order_relaxed);
+            bool const beyond_last_prong = new_prong_index >= prongs_count;
+            if (beyond_last_prong) break;
 
-            task_trampoline_pointer_(task_lambda_pointer_, {thread_index, new_task_index});
+            fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, new_prong_index});
             // ! The decrement must come after the task is executed, as our main thread is waiting
             // ! for that counter to reach zero, to exit the current scope.
-            _FU_MAYBE_UNUSED task_index_t const before_decrement =
-                task_parts_remaining_.fetch_sub(1, std::memory_order_release);
+            _FU_MAYBE_UNUSED prong_index_t const before_decrement =
+                prongs_remaining_.fetch_sub(1, std::memory_order_release);
             assert(before_decrement > 0 && "We can't be here if there are no tasks left");
         }
     }

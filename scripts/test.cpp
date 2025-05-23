@@ -72,7 +72,7 @@ bool contains_iota(std::vector<aligned_visit_t> &visited) noexcept {
     return true;
 }
 
-/** @brief Make sure that `for_each_static` is called the right number of times with the right task IDs. */
+/** @brief Make sure that `for_each_static` is called the right number of times with the right prong IDs. */
 static bool test_for_each_static() noexcept {
 
     std::atomic<std::size_t> counter = 0;
@@ -87,7 +87,7 @@ static bool test_for_each_static() noexcept {
         visited[count_populated].task_index = task_index;
     });
 
-    // Make sure that all task IDs are unique and form the full range of [0, `default_parts`).
+    // Make sure that all prong IDs are unique and form the full range of [0, `default_parts`).
     if (counter.load() != default_parts) return false;
     if (!contains_iota(visited)) return false;
 
@@ -102,7 +102,7 @@ static bool test_for_each_static() noexcept {
     return counter.load() == default_parts && contains_iota(visited);
 }
 
-/** @brief Make sure that `for_each_dynamic` is called the right number of times with the right task IDs. */
+/** @brief Make sure that `for_each_dynamic` is called the right number of times with the right prong IDs. */
 static bool test_for_each_dynamic() noexcept {
 
     fun::fork_union_t pool;
@@ -116,7 +116,7 @@ static bool test_for_each_dynamic() noexcept {
         visited[count_populated].task_index = task_index;
     });
 
-    // Make sure that all task IDs are unique and form the full range of [0, `default_parts`).
+    // Make sure that all prong IDs are unique and form the full range of [0, `default_parts`).
     if (counter.load() != default_parts) return false;
     if (!contains_iota(visited)) return false;
 
@@ -150,7 +150,7 @@ static bool test_oversubscribed_unbalanced_threads() noexcept {
         visited[count_populated].task_index = task_index;
     });
 
-    // Make sure that all task IDs are unique and form the full range of [0, `default_parts`).
+    // Make sure that all prong IDs are unique and form the full range of [0, `default_parts`).
     return counter.load() == default_parts && contains_iota(visited);
 }
 
@@ -194,12 +194,12 @@ struct c_function_context_t {
     std::atomic<std::size_t> &counter;
 };
 
-extern "C" void _handle_one_task(fun::fork_union_t::punned_task_context_t punned_context,
-                                 fun::fork_union_t::task_t task) {
+extern "C" void _handle_one_task(fun::fork_union_t::punned_fork_context_t punned_context,
+                                 fun::fork_union_t::prong_t prong) {
     c_function_context_t const &context = *static_cast<c_function_context_t const *>(punned_context);
     // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
     std::size_t const count_populated = context.counter.fetch_add(1, std::memory_order_relaxed);
-    context.visited_ptr[count_populated].task_index = task.task_index;
+    context.visited_ptr[count_populated].task_index = prong.prong_index;
 }
 
 /** @brief Make sure that all APIs work not only for lambda objects, but also function pointers. */
@@ -213,7 +213,7 @@ static bool test_c_function_pointers() noexcept {
     c_function_context_t context {visited.data(), counter};
     pool.for_each_dynamic(default_parts, fun::fork_union_t::c_callback_t {&_handle_one_task, &context});
 
-    // Make sure that all task IDs are unique and form the full range of [0, `default_parts`).
+    // Make sure that all prong IDs are unique and form the full range of [0, `default_parts`).
     return counter.load() == default_parts && contains_iota(visited);
 }
 
@@ -221,37 +221,37 @@ static bool test_c_function_pointers() noexcept {
  *         stopping them half-way, resetting & reinitializing, and raising exceptions.
  */
 template <typename pool_type_>
-static bool stress_test_composite(std::size_t const thread_count, std::size_t const default_parts) noexcept {
+static bool stress_test_composite(std::size_t const threads_count, std::size_t const default_parts) noexcept {
 
     using pool_t = pool_type_;
     using index_t = typename pool_t::index_t;
-    using task_t = typename pool_t::task_t;
+    using prong_t = typename pool_t::prong_t;
 
     pool_t pool;
-    if (!pool.try_spawn(thread_count)) return false;
+    if (!pool.try_spawn(threads_count)) return false;
 
     // Make sure that no overflow happens in the static scheduling
     std::atomic<std::size_t> counter = 0;
     std::vector<aligned_visit_t> visited(default_parts);
-    pool.for_each_static(default_parts, [&](task_t task) noexcept {
+    pool.for_each_static(default_parts, [&](prong_t prong) noexcept {
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-        visited[count_populated].task_index = task.task_index;
+        visited[count_populated].task_index = prong.prong_index;
     });
     if (counter.load() != default_parts) return false;
     if (!contains_iota(visited)) return false;
 
     // Make sure that no overflow happens in the dynamic scheduling
     counter = 0;
-    pool.for_each_dynamic(default_parts, [&](task_t task) noexcept {
+    pool.for_each_dynamic(default_parts, [&](prong_t prong) noexcept {
         // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
         std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
-        visited[count_populated].task_index = task.task_index;
+        visited[count_populated].task_index = prong.prong_index;
     });
     if (counter.load() != default_parts) return false;
     if (!contains_iota(visited)) return false;
 
-    // Make sure the operations can be interrupted from inside the task
+    // Make sure the operations can be interrupted from inside the prong
     return true;
 }
 
