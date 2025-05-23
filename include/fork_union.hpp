@@ -317,7 +317,7 @@ class fork_union {
         task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current thread
-        _worker_loop_for_dynamic_tasks(0);
+        _worker_loop_for_dynamic_tasks(0, n);
 
         // We may be in the in-flight position, where the current thread is already receiving
         // tasks beyond the `task_parts_count_` index, but the worker threads are still executing
@@ -361,23 +361,27 @@ class fork_union {
                    (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
                 std::this_thread::yield();
 
+            // ? If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
+            // ? we will wrap around the `std::size_t` capacity for the "task generation"
+
             if (wants_to_stop) return;
 
             // Check if we are operating in the "dynamic" eager mode or a balanced "static" mode
-            bool const is_static = task_parts_count_ == total_threads_;
-            if (is_static && task_parts_count_) {
+            task_index_t const task_parts_count = task_parts_count_;
+            bool const is_static = task_parts_count == total_threads_;
+            if (is_static && task_parts_count) {
                 task_trampoline_pointer_(task_lambda_pointer_, {thread_index, thread_index});
                 // ! The decrement must come after the task is executed
                 _FU_MAYBE_UNUSED task_index_t const before_decrement =
                     task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
                 assert(before_decrement > 0 && "We can't be here if there are no worker threads");
             }
-            else { _worker_loop_for_dynamic_tasks(thread_index); }
+            else { _worker_loop_for_dynamic_tasks(thread_index, task_parts_count); }
             last_task_generation = new_task_generation;
         }
     }
 
-    void _worker_loop_for_dynamic_tasks(task_index_t const thread_index) noexcept {
+    void _worker_loop_for_dynamic_tasks(task_index_t const thread_index, task_index_t const task_parts_count) noexcept {
         // Unlike the thread-balanced mode, we need to keep track of the number of passed tasks.
         // The traditional way to achieve that is to use the same single atomic `task_parts_remaining_`
         // variable, but using `compare_exchange_weak` interfaces. It's much more expensive on modern
@@ -386,7 +390,7 @@ class fork_union {
         while (true) {
             // The relative order of executed tasks doesn't matter here, so we can use relaxed memory order.
             task_index_t const new_task_index = task_parts_passed_.fetch_add(1, std::memory_order_relaxed);
-            if (new_task_index >= task_parts_count_) break;
+            if (new_task_index >= task_parts_count) break;
             task_trampoline_pointer_(task_lambda_pointer_, {thread_index, new_task_index});
             // ! The decrement must come after the task is executed
             _FU_MAYBE_UNUSED task_index_t const before_decrement =
