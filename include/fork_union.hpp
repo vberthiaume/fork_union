@@ -73,13 +73,27 @@ static constexpr std::size_t default_alignment_k = alignof(std::max_align_t);
  *  support for atomic fence-less operations on Arm and Power architectures. Most atomic counters
  *  use the "acquire-release" model, and some going further to "relaxed" model.
  *  @see https://en.cppreference.com/w/cpp/atomic/memory_order#Release-Acquire_ordering
+ *
+ *  @param allocator_type_ The type of the allocator to be used for the thread pool.
+ *  @param index_type_ Defaults to `std::size_t`, but can be changed to a smaller type for debugging.
+ *  @param alignment_ The alignment of the thread pool. Defaults to `std::hardware_destructive_interference_size`.
  */
-template <typename allocator_type_ = std::allocator<std::byte>, std::size_t alignment_ = default_alignment_k>
+template <                                                //
+    typename allocator_type_ = std::allocator<std::byte>, //
+    typename index_type_ = std::size_t,                   //
+    std::size_t alignment_ = default_alignment_k          //
+    >
 class fork_union {
   public:
     using allocator_t = allocator_type_;
-    using thread_index_t = std::size_t;
-    using task_index_t = std::size_t;
+    using index_t = index_type_;
+    static constexpr std::size_t alignment_k = alignment_;
+    static_assert(std::is_unsigned<index_t>::value, "Index type must be an unsigned integer");
+    static_assert(alignment_k > 0 && (alignment_k & (alignment_k - 1)) == 0, "Alignment must be a power of 2");
+
+    using thread_index_t = index_t;
+    using task_index_t = index_t;
+    using generation_index_t = index_t;
 
     /**
      *  @brief A POD-type describing a certain part of a parallel task.
@@ -93,7 +107,7 @@ class fork_union {
         thread_index_t thread_index {0};
         task_index_t task_index {0};
 
-        inline operator std::size_t() const noexcept { return task_index; }
+        inline operator task_index_t() const noexcept { return task_index; }
     };
 
     using punned_task_context_t = void const *;
@@ -119,7 +133,7 @@ class fork_union {
     task_index_t task_parts_count_ {0};
     alignas(alignment_) std::atomic<task_index_t> task_parts_remaining_ {0};
     alignas(alignment_) std::atomic<task_index_t> task_parts_passed_ {0}; // ? Only used in dynamic mode
-    alignas(alignment_) std::atomic<std::size_t> task_generation_ {0};
+    alignas(alignment_) std::atomic<generation_index_t> task_generation_ {0};
 
   public:
     fork_union(fork_union &&) = delete;
@@ -129,7 +143,7 @@ class fork_union {
 
     fork_union(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
     ~fork_union() noexcept { stop_and_reset(); }
-    std::size_t thread_count() const noexcept { return total_threads_; }
+    thread_index_t thread_count() const noexcept { return total_threads_; }
 
     /**
      *  @brief Creates a thread-pool with the given number of threads.
@@ -218,7 +232,7 @@ class fork_union {
 
         for_each_slice(n, [function](task_t start_task, task_index_t count) noexcept {
             for (task_index_t i = 0; i < count; ++i)
-                function(task_t {start_task.thread_index, start_task.task_index + i});
+                function(task_t {start_task.thread_index, static_cast<task_index_t>(start_task.task_index + i)});
         });
     }
 
@@ -242,11 +256,16 @@ class fork_union {
         if (total_threads_ == 1 || n == 1) return function(task_t {0, 0}, n);
         if (n == 0) return;
 
-        // Divide and round-up the workload size per thread
-        task_index_t const n_per_thread = (n + total_threads_ - 1) / total_threads_;
+        // Divide and round-up the workload size per thread - assuming some fuzzer may
+        // pass an absurdly large `n` as an input, the addition may overflow,
+        // so `(n + total_threads_ - 1) / total_threads_` is not the safest option.
+        // Instead, we can do: `n / total_threads_ + (n % total_threads_ != 0)`,
+        // but avoiding the cost of the second integer division, replacing it with multiplication.
+        task_index_t const n_per_thread_lower_bound = n / total_threads_;
+        task_index_t const n_per_thread = n_per_thread_lower_bound + (n_per_thread_lower_bound * total_threads_ != n);
         for_each_thread([n, n_per_thread, function](thread_index_t thread_index) noexcept {
-            task_index_t const begin = (std::min)(thread_index * n_per_thread, n);
-            task_index_t const count = (std::min)(begin + n_per_thread, n) - begin;
+            task_index_t const begin = (std::min<task_index_t>)(thread_index * n_per_thread, n);
+            task_index_t const count = (std::min<task_index_t>)(begin + n_per_thread, n) - begin;
             function(task_t {thread_index, begin}, count);
         });
     }
@@ -351,18 +370,15 @@ class fork_union {
      *  @param[in] thread_index The index of the thread that is executing this function.
      */
     void _worker_loop(thread_index_t const thread_index) noexcept {
-        std::size_t last_task_generation = 0;
+        generation_index_t last_task_generation = 0;
 
         while (true) {
             // Wait for either: a new ticket or a stop flag
-            std::size_t new_task_generation;
+            generation_index_t new_task_generation;
             bool wants_to_stop;
             while ((new_task_generation = task_generation_.load(std::memory_order_acquire)) == last_task_generation &&
                    (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
                 std::this_thread::yield();
-
-            // ? If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
-            // ? we will wrap around the `std::size_t` capacity for the "task generation"
 
             if (wants_to_stop) return;
 
@@ -382,20 +398,35 @@ class fork_union {
     }
 
     void _worker_loop_for_dynamic_tasks(task_index_t const thread_index, task_index_t const task_parts_count) noexcept {
+
+        // Track last executed task for the `beyond_task_and_overflow` condition.
+        task_index_t last_executed_task_in_this_thread = 0;
+
         // Unlike the thread-balanced mode, we need to keep track of the number of passed tasks.
         // The traditional way to achieve that is to use the same single atomic `task_parts_remaining_`
         // variable, but using `compare_exchange_weak` interfaces. It's much more expensive on modern
         // CPUs, so we use an additional atomic variable and have 2x atomic increments of 2x atomic variables,
         // instead of 1x atomic load and 1x atomic CAS on 1x atomic variable (in optimistic low-contention case).
         while (true) {
+
             // The relative order of executed tasks doesn't matter here, so we can use relaxed memory order.
             task_index_t const new_task_index = task_parts_passed_.fetch_add(1, std::memory_order_relaxed);
-            if (new_task_index >= task_parts_count) break;
+            bool const beyond_last_task = new_task_index >= task_parts_count;
+            if (beyond_last_task) break;
+
+            // If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
+            // of computational time we will wrap around the `std::size_t` capacity for the `new_task_index`.
+            // In case we `task_parts_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
+            bool const beyond_task_and_overflow = task_parts_count < last_executed_task_in_this_thread;
+            if (beyond_task_and_overflow) [[unlikely]]
+                break;
+
             task_trampoline_pointer_(task_lambda_pointer_, {thread_index, new_task_index});
             // ! The decrement must come after the task is executed
             _FU_MAYBE_UNUSED task_index_t const before_decrement =
                 task_parts_remaining_.fetch_sub(1, std::memory_order_acq_rel);
             assert(before_decrement > 0 && "We can't be here if there are no tasks left");
+            last_executed_task_in_this_thread = new_task_index;
         }
     }
 };
