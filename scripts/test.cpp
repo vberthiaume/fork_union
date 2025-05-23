@@ -154,6 +154,41 @@ static bool test_oversubscribed_unbalanced_threads() noexcept {
     return counter.load() == default_parts && contains_iota(visited);
 }
 
+/** @brief Make sure that that we can combine static and dynamic workloads over the same pool with & w/out resetting. */
+template <bool should_restart_>
+static bool test_mixed_restart() noexcept {
+
+    fun::fork_union_t pool;
+    std::size_t const count_threads = std::thread::hardware_concurrency();
+    if (!pool.try_spawn(count_threads)) return false;
+    std::vector<aligned_visit_t> visited(default_parts);
+    std::atomic<std::size_t> counter = 0;
+
+    pool.for_each_static(default_parts, [&](std::size_t const task_index) noexcept {
+        // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+        std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
+        visited[count_populated].task_index = task_index;
+    });
+    if (counter.load() != default_parts) return false;
+    if (!contains_iota(visited)) return false;
+
+    // Make sure that the pool can be reset and reused
+    if constexpr (should_restart_) {
+        pool.stop_and_reset();
+        if (!pool.try_spawn(count_threads)) return false;
+    }
+
+    // Make sure repeated calls to `for_each_static` work
+    counter = 0;
+    pool.for_each_dynamic(default_parts, [&](std::size_t const task_index) noexcept {
+        // ? Relax the memory order, as we don't care about the order of the results, will sort 'em later
+        std::size_t const count_populated = counter.fetch_add(1, std::memory_order_relaxed);
+        visited[count_populated].task_index = task_index;
+    });
+
+    return counter.load() == default_parts && contains_iota(visited);
+}
+
 struct c_function_context_t {
     aligned_visit_t *visited_ptr;
     std::atomic<std::size_t> &counter;
@@ -235,6 +270,8 @@ int main() {
         {"`for_each_dynamic` dynamic scheduling", test_for_each_dynamic},                      //
         {"`for_each_dynamic` oversubscribed threads", test_oversubscribed_unbalanced_threads}, //
         {"`for_each_dynamic` with C function pointers", test_c_function_pointers},             //
+        {"`stop_and_reset` avoided", test_mixed_restart<false>},                               //
+        {"`stop_and_reset` and re-spawn", test_mixed_restart<true>},                           //
     };
 
     std::size_t const total_unit_tests = sizeof(unit_tests) / sizeof(unit_tests[0]);

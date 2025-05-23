@@ -222,6 +222,7 @@ class fork_union {
         total_threads_ = 0;
         workers_ = nullptr;
         stop_.store(false, std::memory_order_relaxed);
+        task_generation_.store(0, std::memory_order_relaxed);
     }
 
     /**
