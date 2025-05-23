@@ -44,6 +44,7 @@ namespace fork_union {
 /**
  *  @brief Defines variable alignment to avoid false sharing.
  *  @see https://en.cppreference.com/w/cpp/thread/hardware_destructive_interference_size
+ *  @see https://docs.rs/crossbeam-utils/latest/crossbeam_utils/struct.CachePadded.html
  */
 #if defined(__cpp_lib_hardware_interference_size)
 static constexpr std::size_t default_alignment_k = std::hardware_destructive_interference_size;
@@ -68,29 +69,45 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
 /**
  *  @brief Minimalistic STL-based non-resizable thread-pool for simultaneous blocking tasks.
  *
- *  Note, that for N-wide parallelism, it initiates (N-1) threads, and the current caller thread
- *  is also executing tasks. The number of threads is fixed and cannot be changed.
+ *  Fork Union supports 2 modes of operation: static and dynamic. Static mode is designed
+ *  for balanced workloads, taking roughly the same amount of time to execute on each thread.
+ *  Dynamic mode is designed for uneven workloads, with threads "greedying" for work.
  *
- *  Note, the pool is not re-entrant! So you can't recursively submit new tasks!
+ *  This thread-pool @b can't:
+ *  - dynamically @b resize: all threads must be stopped and re-initialized to grow/shrink.
+ *  - @b re-enter: it can't be used recursively and will deadlock if you try to do so.
+ *  - @b copy/move: the threads depend on the address of the parent structure.
+ *  - handle @b exceptions: you must `try-catch` them yourself and return `void`.
+ *  - @b stop early: assuming the user can do it better, knowing the task granularity.
  *
- *  Note, the pool can't be copied or moved, as it's worker threads depend on the address
- *  of the parent structure, spawning them.
+ *  This allows this thread-pool to be extremely lightweight and fast, with no heap allocations
+ *  and no expensive abstractions. It only uses `std::thread` and `std::atomic`, but avoids
+ *  `std::function`, `std::future`, `std::promise`, `std::condition_variable`, that bring
+ *  unnecessary overhead.
+ *  @see https://ashvardanian.com/posts/beyond-openmp-in-cpp-rust/#four-horsemen-of-performance
  *
- *  It avoids heap allocations and expensive abstractions like `std::function`, `std::future`,
- *  `std::promise`, `std::condition_variable`, etc. It only uses `std::thread` and `std::atomic`,
- *  benefiting from the fact, that those are standardized since C++11.
- *
- *  Note, that "stopping" isn't done at a sub-task granularity level. So if you are submitting
- *  a huge task in a "dynamic" eager mode, it's up to you to abrupt it early with extra logic.
- *
- *  Most operations are performed with a "weak" memory model, to be able to leverage in-hardware
- *  support for atomic fence-less operations on Arm and Power architectures. Most atomic counters
+ *  Repeated operations are performed with a "weak" memory model, to be able to leverage in-hardware
+ *  support for atomic fence-less operations on Arm and IBM Power architectures. Most atomic counters
  *  use the "acquire-release" model, and some going further to "relaxed" model.
  *  @see https://en.cppreference.com/w/cpp/atomic/memory_order#Release-Acquire_ordering
  *
+ *  @code{.cpp}
+ *  #include <cstdio> // `std::printf`
+ *  #include <cstdlib> // `EXIT_FAILURE`, `EXIT_SUCCESS`
+ *  #include <fork_union.hpp>
+ *
+ *  using fun = ashvardanian::fork_union;
+ *  int main() {
+ *      fun::fork_union<> pool;
+ *      if (!pool.try_spawn(std::thread::hardware_concurrency())) return EXIT_FAILURE;
+ *      pool.for_each_thread([](std::size_t index) { std::printf("Hello from thread %zu\n", index); });
+ *      return EXIT_SUCCESS;
+ *  }
+ *  @endcode
+ *
  *  @param allocator_type_ The type of the allocator to be used for the thread pool.
  *  @param index_type_ Defaults to `std::size_t`, but can be changed to a smaller type for debugging.
- *  @param alignment_ The alignment of the thread pool. Defaults to `std::hardware_destructive_interference_size`.
+ *  @param alignment_ The alignment of the thread pool. Defaults to `default_alignment_k`.
  */
 template <                                                //
     typename allocator_type_ = std::allocator<std::byte>, //
@@ -197,8 +214,8 @@ class fork_union {
     }
 
     /**
-     *  @brief Stops all threads and deallocates the thread-pool.
-     *  @note Can only be called from the main thread, and can't have any tasks in-flight.
+     *  @brief Stops all threads and deallocates the thread-pool. Must `try_spawn` again to re-use.
+     *  @note Can't be called while any tasks are running.
      */
     void stop_and_reset() noexcept {
         if (total_threads_ == 0) return;                                    // ? Uninitialized
@@ -261,9 +278,10 @@ class fork_union {
 
 #if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
-        static_assert((std::is_nothrow_invocable_r<void, function_type_, task_t, task_index_t>::value ||
-                       std::is_nothrow_invocable_r<void, function_type_, task_index_t, task_index_t>::value),
-                      "The callback must be invocable with a `task_t` or a `task_index_t` argument");
+        static_assert(
+            (std::is_nothrow_invocable_r<void, function_type_, task_t, task_index_t>::value ||
+             std::is_nothrow_invocable_r<void, function_type_, task_index_t, task_index_t>::value),
+            "The callback must be invocable with a `task_t` or a `task_index_t` argument and an unsigned counter");
 #endif
 
         // No need to slice the workload if we only have one thread
@@ -366,10 +384,8 @@ class fork_union {
         task_parts_remaining_.store(n, std::memory_order_relaxed);
         task_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
-        // Execute on the current "main" thread, assuming the last `total_threads_ + 1` will
-        // be handled separately to avoid overflow in the dynamic worker loop. In that case,
-        // each can over-increment by one and we will still have the `SIZE_MAX` available
-        // for comparison.
+        // Execute on the current "main" thread, assuming the last `total_threads_` will
+        // be handled separately to avoid overflow in the dynamic worker loop.
         task_trampoline_pointer_(task_lambda_pointer_, {0, n_without_suffix});
         task_parts_remaining_.fetch_sub(1, std::memory_order_release);
         _worker_loop_for_dynamic_tasks(0, n_without_suffix);
@@ -393,7 +409,7 @@ class fork_union {
     /**
      *  @brief A trampoline function that is used to call the user-defined lambda.
      *  @param[in] punned_lambda_pointer The pointer to the user-defined lambda.
-     *  @param[in] thread_index The index of the thread that is executing this function.
+     *  @param[in] task The index of the thread & task packed together.
      */
     template <typename function_type_>
     static void _call_lambda_from_thread(punned_task_context_t punned_lambda_pointer, task_t task) noexcept {
@@ -468,7 +484,6 @@ class fork_union {
             _FU_MAYBE_UNUSED task_index_t const before_decrement =
                 task_parts_remaining_.fetch_sub(1, std::memory_order_release);
             assert(before_decrement > 0 && "We can't be here if there are no tasks left");
-            last_executed_task_in_this_thread = new_task_index;
         }
     }
 };
