@@ -138,10 +138,10 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *  @param index_type_ Defaults to `std::size_t`, but can be changed to a smaller type for debugging.
  *  @param alignment_ The alignment of the thread pool. Defaults to `default_alignment_k`.
  */
-template <                                                //
-    typename allocator_type_ = std::allocator<std::byte>, //
-    typename index_type_ = std::size_t,                   //
-    std::size_t alignment_ = default_alignment_k          //
+template <                                                  //
+    typename allocator_type_ = std::allocator<std::thread>, //
+    typename index_type_ = std::size_t,                     //
+    std::size_t alignment_ = default_alignment_k            //
     >
 class fork_union {
   public:
@@ -162,6 +162,15 @@ class fork_union {
         thread_index_t thread_index {0};
         prong_index_t prong_index {0};
 
+        inline prong_t() = default;
+        inline prong_t(prong_t const &) = default;
+        inline prong_t(prong_t &&) = default;
+        inline prong_t &operator=(prong_t const &) = default;
+        inline prong_t &operator=(prong_t &&) = default;
+
+        inline prong_t(thread_index_t const thread_index, prong_index_t const prong_index) noexcept
+            : thread_index(thread_index), prong_index(prong_index) {}
+
         inline operator prong_index_t() const noexcept { return prong_index; }
     };
 
@@ -171,6 +180,15 @@ class fork_union {
     struct c_callback_t {
         trampoline_pointer_t callable {nullptr};
         punned_fork_context_t context {nullptr};
+
+        inline c_callback_t() = default;
+        inline c_callback_t(c_callback_t const &) = default;
+        inline c_callback_t(c_callback_t &&) = default;
+        inline c_callback_t &operator=(c_callback_t const &) = default;
+        inline c_callback_t &operator=(c_callback_t &&) = default;
+
+        inline c_callback_t(trampoline_pointer_t const callable, punned_fork_context_t const context) noexcept
+            : callable(callable), context(context) {}
 
         inline void operator()(prong_t prong) const noexcept { callable(context, prong); }
     };
@@ -472,7 +490,8 @@ class fork_union {
             else {
                 // Execute one task per thread separately to avoid possible overflow in the dynamic worker loop
                 prong_index_t const n_without_suffix = prongs_count - threads_count_;
-                fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, n_without_suffix + thread_index});
+                fork_trampoline_pointer_(fork_lambda_pointer_,
+                                         {thread_index, static_cast<prong_index_t>(n_without_suffix + thread_index)});
                 prongs_remaining_.fetch_sub(1, std::memory_order_release);
                 _worker_loop_for_dynamic_tasks(thread_index, n_without_suffix);
             }
