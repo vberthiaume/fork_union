@@ -16,6 +16,12 @@ foreach (STD IN LISTS CXX_STANDARDS)
     # register it as a CTest test
     add_test(NAME ${TGT} COMMAND ${TGT})
 
+    # In release mode, enable optimizations
+    if (CMAKE_BUILD_TYPE STREQUAL "Release")
+        message(STATUS "Enabling optimizations for ${TGT}")
+        target_compile_options(${TGT} PRIVATE -O3)
+    endif ()
+
     # if we’re on GCC and not in Release, turn on TSAN here too
     if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT CMAKE_BUILD_TYPE STREQUAL "Release")
         message(STATUS "Enabling ThreadSanitizer for ${TGT}")
@@ -32,4 +38,10 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     message(STATUS "Enabling OpenMP for fork_union_nbody")
     target_compile_options(fork_union_nbody PRIVATE -fopenmp)
     target_link_options(fork_union_nbody PRIVATE -fopenmp)
+endif ()
+
+# In release mode, enable optimizations
+if (CMAKE_BUILD_TYPE STREQUAL "Release")
+    message(STATUS "Enabling optimizations for fork_union_nbody")
+    target_compile_options(fork_union_nbody PRIVATE -O3)
 endif ()
