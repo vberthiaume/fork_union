@@ -209,8 +209,11 @@ class fork_union {
      */
     bool try_spawn(thread_index_t const planned_threads) noexcept {
         if (planned_threads == 0) return false; // ! Can't have zero threads working on something
-        if (planned_threads == 1) return true;  // ! The current thread will always be used
         if (threads_count_ != 0) return false;  // ! Already initialized
+        if (planned_threads == 1) {
+            threads_count_ = 1; // ! The current thread will always be used
+            return true;
+        }
 
         // Allocate the thread pool
         thread_index_t const worker_threads = planned_threads - 1;
