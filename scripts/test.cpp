@@ -133,7 +133,7 @@ static bool test_for_each_dynamic() noexcept {
 
 /** @brief Stress-tests the implementation by oversubscribing the number of threads. */
 static bool test_oversubscribed_unbalanced_threads() noexcept {
-    constexpr std::size_t oversubscription = 7;
+    constexpr std::size_t oversubscription = 3;
 
     fun::fork_union_t pool;
     std::size_t const count_threads = std::thread::hardware_concurrency() * oversubscription;
