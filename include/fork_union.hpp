@@ -515,9 +515,7 @@ class fork_union {
         // CPUs, so we use an additional atomic variable and have 2x atomic increments of 2x atomic variables,
         // instead of 1x atomic load and 1x atomic CAS on 1x atomic variable (in optimistic low-contention case).
         while (true) {
-
-            // The relative order of executed tasks doesn't matter here, so we can use relaxed memory order.
-            prong_index_t const new_prong_index = prongs_passed_.fetch_add(1, std::memory_order_relaxed);
+            prong_index_t const new_prong_index = prongs_passed_.fetch_add(1, std::memory_order_acq_rel);
             bool const beyond_last_prong = new_prong_index >= prongs_count;
             if (beyond_last_prong) break;
 
