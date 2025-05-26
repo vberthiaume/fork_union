@@ -6,6 +6,18 @@
             "command": "cmake -D CMAKE_BUILD_TYPE=Debug -B build_debug && cmake --build build_debug --config Debug",
             "args": [],
             "type": "shell",
+            "linux": {
+                "environment": [
+                    {
+                        "name": "CXX",
+                        "value": "g++"
+                    },
+                    {
+                        "name": "CC",
+                        "value": "gcc"
+                    }
+                ]
+            },
         },
         {
             "label": "Build: Debug with LLDB",
