@@ -93,23 +93,29 @@ void iteration_openmp_dynamic(std::span<body_t> bodies, std::span<vector3_t> for
 void iteration_fork_union_static(fun::fork_union_t &pool, std::span<body_t> bodies,
                                  std::span<vector3_t> forces) noexcept {
     std::size_t const n = bodies.size();
-    pool.for_each_static(n, [&](std::size_t i) noexcept {
+    body_t *bodies_ptr = bodies.data();
+    vector3_t *forces_ptr = forces.data();
+    pool.for_each_static(n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept {
         vector3_t f {0.0, 0.0, 0.0};
-        for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies[i], bodies[j]);
-        forces[i] = f;
+        for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies_ptr[i], bodies_ptr[j]);
+        forces_ptr[i] = f;
     });
-    pool.for_each_static(n, [&](std::size_t i) noexcept { apply_force(bodies[i], forces[i]); });
+    pool.for_each_static(
+        n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
 }
 
 void iteration_fork_union_dynamic(fun::fork_union_t &pool, std::span<body_t> bodies,
                                   std::span<vector3_t> forces) noexcept {
     std::size_t const n = bodies.size();
-    pool.for_each_dynamic(n, [&](std::size_t i) noexcept {
+    body_t *bodies_ptr = bodies.data();
+    vector3_t *forces_ptr = forces.data();
+    pool.for_each_dynamic(n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept {
         vector3_t f {0.0, 0.0, 0.0};
-        for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies[i], bodies[j]);
-        forces[i] = f;
+        for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies_ptr[i], bodies_ptr[j]);
+        forces_ptr[i] = f;
     });
-    pool.for_each_dynamic(n, [&](std::size_t i) noexcept { apply_force(bodies[i], forces[i]); });
+    pool.for_each_dynamic(
+        n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
 }
 
 int main() {
