@@ -19,7 +19,7 @@ namespace fun = ashvardanian::fork_union;
 struct vector3_t {
     float x, y, z;
 
-    vector3_t &operator+=(vector3_t const &other) noexcept {
+    inline vector3_t &operator+=(vector3_t const &other) noexcept {
         x += other.x;
         y += other.y;
         z += other.z;

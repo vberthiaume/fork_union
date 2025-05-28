@@ -148,19 +148,9 @@ That's it.
 ## Why Not Use $𝑋$
 
 There are many other thread-pool implementations, that are more feature-rich, but have different limitations and design goals.
-Both in C++:
 
-- [`taskflow/taskflow`](https://github.com/taskflow/taskflow) ![https://github.com/taskflow/taskflow](https://img.shields.io/github/stars/taskflow/taskflow)
-- [`progschj/ThreadPool`](https://github.com/progschj/ThreadPool) ![https://github.com/progschj/ThreadPool](https://img.shields.io/github/stars/progschj/ThreadPool)
-- [`bshoshany/thread-pool`](https://github.com/bshoshany/thread-pool) ![https://github.com/bshoshany/thread-pool](https://img.shields.io/github/stars/bshoshany/thread-pool)
-- [`vit-vit/CTPL`](https://github.com/vit-vit/CTPL) ![https://github.com/vit-vit/CTPL](https://img.shields.io/github/stars/vit-vit/CTPL)
-- [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool) ![https://github.com/mtrebi/thread-pool](https://img.shields.io/github/stars/mtrebi/thread-pool)
-
-... and in Rust:
-
-- [`tokio-rs/tokio`](https://github.com/tokio-rs/tokio) ![https://github.com/tokio-rs/tokio](https://img.shields.io/github/stars/tokio-rs/tokio)
-- [`rayon-rs/rayon`](https://github.com/rayon-rs/rayon) ![https://github.com/rayon-rs/rayon](https://img.shields.io/github/stars/rayon-rs/rayon)
-- [`smol-rs/smol`](https://github.com/smol-rs/smol) ![https://github.com/smol-rs/smol](https://img.shields.io/github/stars/smol-rs/smol)
+- C++: [`taskflow/taskflow`](https://github.com/taskflow/taskflow), [`progschj/ThreadPool`](https://github.com/progschj/ThreadPool), [`bshoshany/thread-pool`](https://github.com/bshoshany/thread-pool), [`vit-vit/CTPL`](https://github.com/vit-vit/CTPL), [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool)
+- Rust: [`tokio-rs/tokio`](https://github.com/tokio-rs/tokio), [`rayon-rs/rayon`](https://github.com/rayon-rs/rayon), [`smol-rs/smol`](https://github.com/smol-rs/smol)
 
 Those are not designed for the same OpenMP-like use-cases as __`fork_union`__.
 Instead, they primarily focus on task queueing, which requires a lot more work.
@@ -208,38 +198,61 @@ That's why for the "dynamic" mode, we resort to using an additional atomic varia
 ### Alignment
 
 Assuming a thread-pool is a heavy object anyway, nobody will care if it's a bit larger than expected.
-That allows us to over-align the internal counters to `std::max_align_t` to avoid false sharing.
+That allows us to over-align the internal counters to `std::hardware_destructive_interference_size` to avoid false sharing.
 In that case, even on x86, where the entire cache will be exclusively owned by a single thread, in eager mode, we end up effectively "pipelining" the execution, where one thread may be incrementing the "in-flight" counter, while the other is decrementing the "remaining" counter, and others are executing the loop body in-between.
 
 ## Performance
 
-The performance goal of Fork Union is to be comparable to OpenMP when running on a single NUMA node.
-In [Parallel Reductions](https://github.com/ashvardanian/ParallelReductionsBenchmark), on tiny inputs, it has the following performance:
+One of the most common parallel workloads is the N-body simulation.
+An implementation is available in both C++ and Rust in `scripts/nbody.cpp` and `scripts/nbody.rs` respectively.
+Both are extremely light-weight and involve little logic outside of number-crunching, so both can be easily profiled with `time` and introspected with `perf` Linux tools. 
+
+> Another common workload is [Parallel Reductions](https://github.com/ashvardanian/ParallelReductionsBenchmark).
+
+### C++ Benchmarks
+
+For $N=128$ bodies, $I=1e6$ iterations, using the maximum number of threads available on the machine, the numbers are as follows:
+
+| Machine        | OpenMP (D) | OpenMP (S) | Fork Union (D) | Fork Union (S) |
+| :------------- | ---------: | ---------: | -------------: | -------------: |
+| 16x Intel SPR  |      20.3s |      16.0s |          18.1s |          10.3s |
+| 12x Apple M2   |          ? |      76.7s |        90.3s ¹ |       100.7s ¹ |
+| 96x Graviton 4 |      32.2s |      20.8s |           41.2 |          26.0s |
+
+> ¹ When a combination of performance and efficiency cores is used, dynamic stealing may be more efficient than static slicing.
+
+To reproduce on your Linux machine, run the following commands:
 
 ```bash
-$ PARALLEL_REDUCTIONS_LENGTH=1536 build_release/reduce_bench
-----------------------------------------------------------------------------
-Benchmark                 Time             CPU   Iterations UserCounters...
-----------------------------------------------------------------------------
-std::threads         2047275 ns      2008267 ns        13751 bytes/s=3.00106M/s
-tf::taskflow          109782 ns       106764 ns       254660 bytes/s=76.2837M/s
-av::fork_union         13136 ns        13136 ns      2117597 bytes/s=467.714M/s
-openmp                 10494 ns        10256 ns      2848849 bytes/s=585.492M/s
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=clang++-15
+cmake --build build_release --config Release
+time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 NBODY_BACKEND=openmp_static build_release/scripts/fork_union_nbody
+time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 NBODY_BACKEND=openmp_dynamic build_release/scripts/fork_union_nbody
+time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 NBODY_BACKEND=fork_union_static build_release/scripts/fork_union_nbody
+time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 NBODY_BACKEND=fork_union_dynamic build_release/scripts/fork_union_nbody
 ```
+
+### Rust Benchmarks
+
+For $N=128$ bodies, $I=1e6$ iterations, using the maximum number of threads available on the machine, the numbers are as follows:
+
+| Machine       | Tokio | Rayon | Fork Union (D) | Fork Union (S) |
+| :------------ | ----: | ----: | -------------: | -------------: |
+| 16x Intel SPR |       |       |                |                |
 
 ## Safety & Logic
 
 There are only 4 atomic variables in this thread-pool, and some of them are practically optional.
 Let's call every invocation of `for_each_*` a "fork", and every exit from it a "join".
 
-| Variable           | Users Perspective                        | Internal Usage                                  |
-| :----------------- | :--------------------------------------- | :---------------------------------------------- |
-| `stop`             | Stop the entire thread-pool              | Checked by the worker to exit the loop          |
-| `fork_generation`  | How many "forks" have been finished      | Checked by the worker to wake up on new "forks" |
-| `prongs_remaining` | Number of tasks left in this "fork"      | Checked by the main thread to "join" workers    |
-| `prongs_passed`    | Number of tasks completed in this "fork" | Checked in "dynamic" mode to distribute work    |
+| Variable           | Users Perspective                   | Internal Usage                          |
+| :----------------- | :---------------------------------- | :-------------------------------------- |
+| `stop`             | Stop the entire thread-pool         | Tells workers when to exit the loop     |
+| `fork_generation`  | How many "forks" have been finished | Tells workers to wake up on new "forks" |
+| `prongs_remaining` | Number of tasks left in this "fork" | Tells main thread when workers finish   |
+| `prongs_passed`    | Number of tasks done in this "fork" | Helps balance work in "dynamic" mode    |
 
-Why use `prongs_remaining` and `prongs_passed`?
+__Why use `prongs_remaining` and `prongs_passed`?__
 When greedily stealing tasks from each other, we need to:
 
 1. Poll an incomplete task index.
@@ -248,19 +261,19 @@ When greedily stealing tasks from each other, we need to:
 
 Trivial, but we can't do 3 before we do 2, as otherwise, the calling thread will exit too early, and we will face Undefined Behavior.
 Using two atomic variables our task polling becomes largely independent of the task completion.
-Moreover, we can use `relaxed` memory ordering for `prongs_passed`, as we don't care which thread gets which task.
+Moreover, we don't need to enforce the strictest memory ordering rules for `prongs_passed`.
 
-Why don't we need atomics for `total_threads`?
+__Why don't we need atomics for `total_threads`?__
 The only way to change the number of threads is to `stop_and_reset` the entire thread-pool and then `try_spawn` it again.
 Either of those operations can only be called from one thread at a time and never coincides with any running tasks.
 That's ensured by the `stop`.
 
-Why don't we need atomics for `task_parts` and `task_pointer`?
+__Why don't we need atomics for `task_parts` and `task_pointer`?__
 A new task can only be submitted from one thread, that updates the number of parts for each new "fork".
 During that update, the workers are asleep, spinning on old values of `fork_generation` and `stop`.
 They only wake up and access the new value once `fork_generation` increments, ensuring safety.
 
-How do we deal with overflows and `SIZE_MAX`-sized tasks?
+__How do we deal with overflows and `SIZE_MAX`-sized tasks?__
 The library entirely avoids saturating multiplication and only uses one saturating addition in "release" builds.
 To test the consistency of arithmetic, the C++ template class can be instantiated with a custom `index_type_t`, such as `std::uint8_t` or `std::uint16_t`.
 In the former case, no more than 255 threads can operate and no more than 255 tasks can be addressed, allowing us to easily test every weird corner case of [0:255] threads competing for [0:255] tasks.
@@ -270,7 +283,7 @@ In the former case, no more than 255 threads can operate and no more than 255 ta
 To run the C++ tests, use CMake:
 
 ```bash
-cmake -B build_release -D CMAKE_BUILD_TYPE=Release
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=clang++-15
 cmake --build build_release --config Release
 build_release/scripts/fork_union_test_cpp20
 ```
@@ -278,7 +291,15 @@ build_release/scripts/fork_union_test_cpp20
 For C++ debug builds, consider using the VS Code debugger presets or the following commands:
 
 ```bash
-cmake -B build_debug -D CMAKE_BUILD_TYPE=Debug
+cmake --build build_debug --config Debug
+build_debug/scripts/fork_union_test_cpp20
+```
+
+To build with an alternative compiler, like LLVM Clang, use the following command:
+
+```bash
+sudo apt-get install libomp-15-dev clang++-15 # OpenMP version must match Clang
+cmake -B build_debug -D CMAKE_BUILD_TYPE=Debug -D CMAKE_CXX_COMPILER=clang++-15
 cmake --build build_debug --config Debug
 build_debug/scripts/fork_union_test_cpp20
 ```

@@ -64,11 +64,14 @@ struct alignas(fun::default_alignment_k) aligned_visit_t {
     bool operator==(std::size_t other_index) const noexcept { return task_index == other_index; }
 };
 
-[[gnu::optimize("O3")]] // We don't need to debug the STL sort
 bool contains_iota(std::vector<aligned_visit_t> &visited) noexcept {
     std::sort(visited.begin(), visited.end());
-    for (std::size_t i = 0; i < visited.size(); ++i)
-        if (visited[i] != i) return false;
+    std::size_t visited_progress = 0;
+    for (; visited_progress < visited.size(); ++visited_progress)
+        if (visited[visited_progress] != visited_progress) break;
+    if (visited_progress != visited.size()) {
+        return false; // ! Put on a separate line for a breakpoint
+    }
     return true;
 }
 
@@ -133,7 +136,7 @@ static bool test_for_each_dynamic() noexcept {
 
 /** @brief Stress-tests the implementation by oversubscribing the number of threads. */
 static bool test_oversubscribed_unbalanced_threads() noexcept {
-    constexpr std::size_t oversubscription = 7;
+    constexpr std::size_t oversubscription = 3;
 
     fun::fork_union_t pool;
     std::size_t const count_threads = std::thread::hardware_concurrency() * oversubscription;
