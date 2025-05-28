@@ -232,14 +232,14 @@ openmp                 10494 ns        10256 ns      2848849 bytes/s=585.492M/s
 There are only 4 atomic variables in this thread-pool, and some of them are practically optional.
 Let's call every invocation of `for_each_*` a "fork", and every exit from it a "join".
 
-| Variable           | Users Perspective                        | Internal Usage                                  |
-| :----------------- | :--------------------------------------- | :---------------------------------------------- |
-| `stop`             | Stop the entire thread-pool              | Checked by the worker to exit the loop          |
-| `fork_generation`  | How many "forks" have been finished      | Checked by the worker to wake up on new "forks" |
-| `prongs_remaining` | Number of tasks left in this "fork"      | Checked by the main thread to "join" workers    |
-| `prongs_passed`    | Number of tasks completed in this "fork" | Checked in "dynamic" mode to distribute work    |
+| Variable          | Users Perspective                        | Internal Usage                                  |
+| :---------------- | :--------------------------------------- | :---------------------------------------------- |
+| `stop`            | Stop the entire thread-pool              | Checked by the worker to exit the loop          |
+| `fork_generation` | How many "forks" have been finished      | Checked by the worker to wake up on new "forks" |
+| `threads_to_sync` | Number of tasks left in this "fork"      | Checked by the main thread to "join" workers    |
+| `prongs_passed`   | Number of tasks completed in this "fork" | Checked in "dynamic" mode to distribute work    |
 
-Why use `prongs_remaining` and `prongs_passed`?
+Why use `threads_to_sync` and `prongs_passed`?
 When greedily stealing tasks from each other, we need to:
 
 1. Poll an incomplete task index.
