@@ -14,18 +14,14 @@ This is where __`fork_union`__ comes in with a minimalistic STL implementation o
 
 ## Usage
 
-The __`fork_union`__ supports just 2 operation modes:
-
-- __"Static"__ - even slicing for tasks with uniform cost.
-- __"Dynamic"__ - work-stealing for uneven workloads.
-
+The __`fork_union`__ is dead-simple!
 There is no nested parallelism, exception-handling, or "futures promises".
-Only 4 simple APIs:
+The thread pool has just one core API - `broadcast` to launch a callback on each thread.
+The higher-level API for index-addressable tasks are:
 
-- `for_each_thread` - to dispatch a callback per thread.
-- `for_each_static` - for individual evenly-sized tasks.
-- `for_each_slice` - for slices of evenly-sized tasks.
-- `for_each_dynamic` - for individual unevenly-sized tasks.
+- `for_n` - for individual evenly-sized tasks.
+- `for_n_dynamic` - for individual unevenly-sized tasks.
+- `for_slices` - for slices of evenly-sized tasks.
 
 Both are available in C++ and Rust.
 
@@ -36,16 +32,16 @@ A minimal example may look like this:
 ```rs
 use fork_union::spawn;
 let pool = spawn(2);
-pool.for_each_thread(|thread_index| {
+pool.broadcast(|thread_index| {
     println!("Hello from thread # {}", thread_index + 1);
 });
-pool.for_each_static(1000, |task_index| {
+for_n(pool, 1000, |task_index| {
     println!("Running task {} of 3", task_index + 1);
 });
-pool.for_each_slice(1000, |first_index, count| {
+for_slices(pool, 1000, |first_index, count| {
     println!("Running slice [{}, {})", first_index, first_index + count);
 });
-pool.for_each_dynamic(1000, |task_index| {
+for_n_dynamic(pool, 1000, |task_index| {
     println!("Running dynamic task {} of 1000", task_index + 1);
 });
 
@@ -68,7 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pool = ForkUnion::try_spawn_in(4, Global)?;
     let pool = ForkUnion::try_named_spawn("heavy-math", 4)?;
     let pool = ForkUnion::try_named_spawn_in("heavy-math", 4, Global)?;
-    pool.for_each_dynamic(400, |i| {
+    for_n_dynamic(pool, 400, |i| {
         heavy_math(i);
     });
     Ok(())
@@ -103,17 +99,17 @@ Then, include the header in your C++ code:
 #include <cstdio>           // `stderr`
 #include <cstdlib>          // `EXIT_SUCCESS`
 
-namespace fun = ashvardanian::fork_union;
+namespace fu = ashvardanian::fork_union;
 
 int main() {
-    fun::fork_union_t pool;
+    fu::fork_union_t pool;
     if (!pool.try_spawn(std::thread::hardware_concurrency())) {
         std::fprintf(stderr, "Failed to fork the threads\n");
         return EXIT_FAILURE;
     }
 
     // Dispatch a callback to each thread in the pool
-    pool.for_each_thread([&](std::size_t thread_index) noexcept {
+    pool.broadcast([&](std::size_t thread_index) noexcept {
         std::printf("Hello from thread # %zu (of %zu)\n", thread_index + 1, pool.count_threads());
     });
 
@@ -123,20 +119,20 @@ int main() {
     //      #pragma omp parallel for schedule(static)
     //      for (int i = 0; i < 1000; ++i) { ... }
     //
-    // You can also think about it as a shortcut for the `for_each_slice` + `for`.
-    pool.for_each_static(1000, [](std::size_t task_index) noexcept {
+    // You can also think about it as a shortcut for the `for_slices` + `for`.
+    fu::for_n(pool, 1000, [](std::size_t task_index) noexcept {
         std::printf("Running task %zu of 3\n", task_index + 1);
     });
-    pool.for_each_slice(1000, [](std::size_t first_index, std::size_t count) noexcept {
+    fu::for_slices(pool, 1000, [](std::size_t first_index, std::size_t count) noexcept {
         std::printf("Running slice [%zu, %zu)\n", first_index, first_index + count);
     });
 
-    // Like `for_each_static`, but each thread greedily steals tasks, without waiting for  
+    // Like `for_n`, but each thread greedily steals tasks, without waiting for  
     // the others or expecting individual tasks to have same runtimes. Analogous to:
     //
     //      #pragma omp parallel for schedule(dynamic, 1)
     //      for (int i = 0; i < 3; ++i) { ... }
-    pool.for_each_dynamic(3, [](std::size_t task_index) noexcept {
+    fu::for_n_dynamic(pool, 3, [](std::size_t task_index) noexcept {
         std::printf("Running dynamic task %zu of 1000\n", task_index + 1);
     });
     return EXIT_SUCCESS;

@@ -3,6 +3,41 @@
  *  @brief  Minimalistic C++ thread-pool designed for SIMT-style 'Fork-Join' parallelism.
  *  @author Ash Vardanian
  *  @date   May 2, 2025
+ *
+ *  Fork Union provides a minimalistic cross-platform thread-pool implementation and Parallel Algorithms,
+ *  avoiding dynamic memory allocations, exceptions, system calls, and heavy Compare-And-Swap instructions.
+ *  The library leverages the "weak memory model" to allow Arm and IBM Power CPUs to aggressively optimize
+ *  optimize execution at runtime. It's compatible with C++11 and later.
+ *
+ *  @code{.cpp}
+ *  #include <cstdio> // `std::printf`
+ *  #include <cstdlib> // `EXIT_FAILURE`, `EXIT_SUCCESS`
+ *  #include <fork_union.hpp> // `fu::thread_pool_t`
+ *
+ *  using fu = ashvardanian::fork_union;
+ *  int main(int argc, char *argv[]) {
+ *
+ *      fu::thread_pool_t pool;
+ *      if (!pool.try_spawn(std::thread::hardware_concurrency()))
+ *          return EXIT_FAILURE;
+ *
+ *      fu::for_n(pool, argc, [](auto prong) {
+ *          auto const [thread_index, task_index] = prong;
+ *          std::printf(
+ *              "Printing argument %zu from thread %zu: %s\n",
+ *              task_index, thread_index, argv[task_index]);
+ *      });
+ *      return EXIT_SUCCESS;
+ *  }
+ *  @endcode
+ *
+ *  Sever
+ *  Parallel Algorithms, similar to the C++ Standard Library's `std::for_each`, `std::transform`, etc.,
+ *  are provided, including:
+ *
+ *  - `for_n` - for iterating over a range of similar duration tasks, addressable by an index.
+ *  - `for_n_dynamic` - for unevenly distributed tasks, where each task may take a different time.
+ *  - `for_slices` - for iterating over a range of similar duration tasks, addressable by a slice.
  */
 #pragma once
 #include <memory>  // `std::allocator`
@@ -11,6 +46,10 @@
 #include <cstddef> // `std::max_align_t`
 #include <cassert> // `assert`
 #include <new>     // `std::hardware_destructive_interference_size`
+
+#if defined(FU_ALLOW_UNSAFE)
+#include <exception> // `std::exception_ptr`
+#endif
 
 #define FORK_UNION_VERSION_MAJOR 0
 #define FORK_UNION_VERSION_MINOR 3
@@ -66,13 +105,10 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
 #endif
 }
 
+#pragma region - Thread Pool
+
 /**
- *  @brief  Minimalistic STL-based non-resizable thread-pool for simultaneous blocking tasks.
- *          "Fork" many threads, enumerate the "prongs" of the "fork", and "join" them back :)
- *
- *  Fork Union supports 2 modes of operation: static and dynamic. Static mode is designed
- *  for balanced workloads, taking roughly the same amount of time to execute on each thread.
- *  Dynamic mode is designed for uneven workloads, with threads "greedying" for work.
+ *  @brief Minimalistic STL-based non-resizable thread-pool for simultaneous blocking tasks.
  *
  *  This thread-pool @b can't:
  *  - dynamically @b resize: all threads must be stopped and re-initialized to grow/shrink.
@@ -93,8 +129,6 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *  @see https://en.cppreference.com/w/cpp/atomic/memory_order#Release-Acquire_ordering
  *  @see https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2020/p2055r0.pdf
  *
- *  @section Usage
- *
  *  A minimal example, similar to `#pragma omp parallel` in OpenMP:
  *
  *  @code{.cpp}
@@ -102,35 +136,11 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *  #include <cstdlib> // `EXIT_FAILURE`, `EXIT_SUCCESS`
  *  #include <fork_union.hpp>
  *
- *  using fun = ashvardanian::fork_union;
+ *  using fu = ashvardanian::fork_union;
  *  int main() {
- *      fun::fork_union<> pool;
+ *      fu::thread_pool<> pool; // ? Or `fu::thread_pool_t` alias
  *      if (!pool.try_spawn(std::thread::hardware_concurrency())) return EXIT_FAILURE;
- *      pool.for_each_thread([](std::size_t index) { std::printf("Hello from thread %zu\n", index); });
- *      return EXIT_SUCCESS;
- *  }
- *  @endcode
- *
- *  User callbacks in a simple case receive just a single integer identifying the part
- *  of the task to be executed. For more advanced use-cases, when the user needs to know
- *  the thread ID (likely to use some thread-local storage), the callbacks should receive
- *  a `prong_t` argument, and unpack the thread ID from it.
- *
- *  @code{.cpp}
- *  #include <cstdio> // `std::printf`
- *  #include <cstdlib> // `EXIT_FAILURE`, `EXIT_SUCCESS`
- *  #include <fork_union.hpp>
- *
- *  using fun = ashvardanian::fork_union;
- *  int main() {
- *      fun::fork_union<> pool;
- *      if (!pool.try_spawn(std::thread::hardware_concurrency()))
- *          return EXIT_FAILURE;
- *
- *      pool.for_each_slice([](auto prong) {
- *          auto const [thread_index, task_index] = prong;
- *          std::printf("Executing task %zu on core %zu\n", task_index, thread_index);
- *      });
+ *      pool.broadcast([](std::size_t index) { std::printf("Hello from thread %zu\n", index); });
  *      return EXIT_SUCCESS;
  *  }
  *  @endcode
@@ -144,55 +154,20 @@ template <                                                  //
     typename index_type_ = std::size_t,                     //
     std::size_t alignment_ = default_alignment_k            //
     >
-class fork_union {
+class thread_pool {
+
   public:
     using allocator_t = allocator_type_;
-    using index_t = index_type_;
     static constexpr std::size_t alignment_k = alignment_;
-    static_assert(std::is_unsigned<index_t>::value, "Index type must be an unsigned integer");
     static_assert(alignment_k > 0 && (alignment_k & (alignment_k - 1)) == 0, "Alignment must be a power of 2");
 
-    using thread_index_t = index_t;     // A.k.a. "core index" or "thread ID" in [0, threads_count)
-    using prong_index_t = index_t;      // A.k.a. "task index" or "task ID" in the context of a task
-    using generation_index_t = index_t; // A.k.a. number of previous API calls in [0, UINT_MAX)
+    using index_t = index_type_;
+    static_assert(std::is_unsigned<index_t>::value, "Index type must be an unsigned integer");
+    using generation_index_t = index_t; // ? A.k.a. number of previous API calls in [0, UINT_MAX)
+    using thread_index_t = index_t;     // ? A.k.a. "core index" or "thread ID" in [0, threads_count)
 
-    /**
-     *  @brief A POD-type describing a certain part of a parallel task.
-     */
-    struct prong_t {
-        thread_index_t thread_index {0};
-        prong_index_t prong_index {0};
-
-        inline prong_t() = default;
-        inline prong_t(prong_t const &) = default;
-        inline prong_t(prong_t &&) = default;
-        inline prong_t &operator=(prong_t const &) = default;
-        inline prong_t &operator=(prong_t &&) = default;
-
-        inline prong_t(thread_index_t const thread_index, prong_index_t const prong_index) noexcept
-            : thread_index(thread_index), prong_index(prong_index) {}
-
-        inline operator prong_index_t() const noexcept { return prong_index; }
-    };
-
-    using punned_fork_context_t = void const *;
-    using trampoline_pointer_t = void (*)(punned_fork_context_t, prong_t);
-
-    struct c_callback_t {
-        trampoline_pointer_t callable {nullptr};
-        punned_fork_context_t context {nullptr};
-
-        inline c_callback_t() = default;
-        inline c_callback_t(c_callback_t const &) = default;
-        inline c_callback_t(c_callback_t &&) = default;
-        inline c_callback_t &operator=(c_callback_t const &) = default;
-        inline c_callback_t &operator=(c_callback_t &&) = default;
-
-        inline c_callback_t(trampoline_pointer_t const callable, punned_fork_context_t const context) noexcept
-            : callable(callable), context(context) {}
-
-        inline void operator()(prong_t prong) const noexcept { callable(context, prong); }
-    };
+    using punned_fork_context_t = void const *;                           // ? Pointer to the on-stack lambda
+    using trampoline_t = void (*)(punned_fork_context_t, thread_index_t); // ? Wraps lambda's `operator()`
 
   private:
     // Thread-pool-specific variables:
@@ -202,21 +177,19 @@ class fork_union {
     alignas(alignment_) std::atomic<bool> stop_ {false};
 
     // Task-specific variables:
-    punned_fork_context_t fork_lambda_pointer_ {nullptr};    // ? Pointer to the users lambda
-    trampoline_pointer_t fork_trampoline_pointer_ {nullptr}; // ? Calls the lambda
-    prong_index_t prongs_count_ {0};
+    punned_fork_context_t fork_lambda_pointer_ {nullptr}; // ? Pointer to the users lambda
+    trampoline_t fork_trampoline_pointer_ {nullptr};      // ? Calls the lambda
     alignas(alignment_) std::atomic<thread_index_t> threads_to_sync_ {0};
-    alignas(alignment_) std::atomic<prong_index_t> prongs_progress_ {0}; // ? Only used in dynamic mode
     alignas(alignment_) std::atomic<generation_index_t> fork_generation_ {0};
 
   public:
-    fork_union(fork_union &&) = delete;
-    fork_union(fork_union const &) = delete;
-    fork_union &operator=(fork_union &&) = delete;
-    fork_union &operator=(fork_union const &) = delete;
+    thread_pool(thread_pool &&) = delete;
+    thread_pool(thread_pool const &) = delete;
+    thread_pool &operator=(thread_pool &&) = delete;
+    thread_pool &operator=(thread_pool const &) = delete;
 
-    fork_union(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
-    ~fork_union() noexcept { stop_and_reset(); }
+    thread_pool(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
+    ~thread_pool() noexcept { stop_and_reset(); }
     thread_index_t threads_count() const noexcept { return threads_count_; }
 
     /**
@@ -292,99 +265,29 @@ class fork_union {
     }
 
     /**
-     *  @brief Distributes @p (n) similar duration calls between threads.
-     *  @param[in] n The number of times to call the @p function.
-     *  @param[in] function The callback, receiving @b `prong_t` or a call index as an argument.
-     *
-     *  Is designed for a "balanced" workload, where all threads have roughly the same amount of work.
-     *  @sa `for_each_dynamic` for a more dynamic workload.
-     *  The @p function is called @p (n) times, and each thread receives a slice of consecutive tasks.
-     *  @sa `for_each_slice` if you prefer to receive workload slices over individual indices.
-     */
-    template <typename function_type_>
-    void for_each_static(prong_index_t const n, function_type_ const &function) noexcept {
-
-#if _FU_DETECT_CPP_17
-        // ? Exception handling and aggregating return values drastically increases code complexity
-        static_assert((std::is_nothrow_invocable_r<void, function_type_, prong_t>::value ||
-                       std::is_nothrow_invocable_r<void, function_type_, prong_index_t>::value),
-                      "The callback must be invocable with a `prong_t` or a `prong_index_t` argument");
-#endif
-
-        for_each_slice(n, [function](prong_t start_task, prong_index_t count) noexcept {
-            for (prong_index_t i = 0; i < count; ++i)
-                function(prong_t {start_task.thread_index, static_cast<prong_index_t>(start_task.prong_index + i)});
-        });
-    }
-
-    /**
-     *  @brief Distributes @p (n) similar duration calls between threads in slices, as opposed to individual indices.
-     *  @param[in] n The total length of the range to split between threads.
-     *  @param[in] function The callback, receiving @b `prong_t` or an unsigned integer and the slice length.
-     */
-    template <typename function_type_>
-    void for_each_slice(prong_index_t const n, function_type_ const &function) noexcept {
-
-#if _FU_DETECT_CPP_17
-        // ? Exception handling and aggregating return values drastically increases code complexity
-        static_assert(
-            (std::is_nothrow_invocable_r<void, function_type_, prong_t, prong_index_t>::value ||
-             std::is_nothrow_invocable_r<void, function_type_, prong_index_t, prong_index_t>::value),
-            "The callback must be invocable with a `prong_t` or a `prong_index_t` argument and an unsigned counter");
-#endif
-
-        // No need to slice the workload if we only have one thread
-        assert(threads_count_ != 0 && "Thread pool not initialized");
-        if (threads_count_ == 1 || n == 1) return function(prong_t {0, 0}, n);
-        if (n == 0) return;
-
-        // Divide and round-up the workload size per thread - assuming some fuzzer may
-        // pass an absurdly large `n` as an input, the addition may overflow,
-        // so `(n + threads_count_ - 1) / threads_count_` is not the safest option.
-        // Instead, we can do: `n / threads_count_ + (n % threads_count_ != 0)`,
-        // but avoiding the cost of the second integer division, replacing it with multiplication.
-        prong_index_t const n_per_thread_lower_bound = n / threads_count_;
-        prong_index_t const n_per_thread = n_per_thread_lower_bound + ((n_per_thread_lower_bound * threads_count_) < n);
-        for_each_thread([n, n_per_thread, n_per_thread_lower_bound, function](thread_index_t thread_index) noexcept {
-            // Multiplying `thread_index` by `n_per_thread` may overflow. For an 8-bit `prong_index_t` type:
-            // - 254 threads,
-            // - 255 tasks,
-            // - each thread gets 1 or 2 tasks
-            // In that case, both `begin` and `begin_lower_bound` will overflow, but we can use
-            // their relative values to determine the real slice length for the thread.
-            prong_index_t const begin = thread_index * n_per_thread;                         // ? Handled overflow
-            prong_index_t const begin_lower_bound = n_per_thread_lower_bound * thread_index; // ? Handled overflow
-            bool const begin_overflows = begin_lower_bound > begin;
-            bool const begin_exceeds_n = begin >= n;
-            if (begin_overflows || begin_exceeds_n) return;
-            prong_index_t const count = (std::min<prong_index_t>)(add_sat(begin, n_per_thread), n) - begin;
-            function(prong_t {thread_index, begin}, count);
-        });
-    }
-
-    /**
      *  @brief Executes a function in parallel on the current and all worker threads.
      *  @param[in] function The callback, receiving the thread index as an argument.
      */
     template <typename function_type_>
-    void for_each_thread(function_type_ const &function) noexcept {
-        if (threads_count_ == 1) return function(0);
+    void broadcast(function_type_ const &function) noexcept {
+        assert(threads_count_ != 0 && "Thread pool not initialized");
+        if (threads_count_ == 1) return function(static_cast<thread_index_t>(0));
 
 #if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
-        static_assert(std::is_nothrow_invocable_r<void, function_type_, prong_index_t>::value,
-                      "The callback must be invocable with a `prong_index_t` argument");
+        // ? we live to the higher-level algorithms.
+        static_assert(std::is_nothrow_invocable_r<void, function_type_, thread_index_t>::value,
+                      "The callback must be invocable with a `thread_index_t` argument");
 #endif
 
         // Configure "fork" details
         fork_lambda_pointer_ = std::addressof(function);
-        fork_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
-        prongs_count_ = threads_count_;
+        fork_trampoline_pointer_ = &_call_as_lambda<function_type_>;
         threads_to_sync_.store(threads_count_ - 1, std::memory_order_relaxed);
         fork_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current "main" thread
-        function(0);
+        function(static_cast<thread_index_t>(0));
 
         // Wait until all threads are done
         while (threads_to_sync_.load(std::memory_order_acquire)) std::this_thread::yield();
@@ -393,63 +296,8 @@ class fork_union {
         _reset_fork_description();
     }
 
-    /**
-     *  @brief Executes uneven tasks on all threads, greedying for work.
-     *  @param[in] n The number of times to call the @p function.
-     *  @param[in] function The callback, receiving the `prong_t` or the task index as an argument.
-     *  @sa `for_each_static` for a more "balanced" evenly-splittable workload.
-     */
-    template <typename function_type_>
-    void for_each_dynamic(prong_index_t const n, function_type_ const &function) noexcept {
-
-#if _FU_DETECT_CPP_17
-        // ? Exception handling and aggregating return values drastically increases code complexity
-        static_assert((std::is_nothrow_invocable_r<void, function_type_, prong_t>::value ||
-                       std::is_nothrow_invocable_r<void, function_type_, prong_index_t>::value),
-                      "The callback must be invocable with a `prong_t` or a `prong_index_t` argument");
-#endif
-
-        // If there is just one thread, all work is done on the current thread
-        if (threads_count_ == 1) {
-            for (prong_index_t i = 0; i < n; ++i) function(prong_t {0, i});
-            return;
-        }
-
-        // No need to slice the work if there is just one task
-        if (n == 0) return;
-        if (n == 1) return function(prong_t {0, 0});
-
-        // If there are fewer tasks than threads, each thread gets at most 1 task
-        // and that's easier to schedule statically!
-        prong_index_t const prongs_static = threads_count_;
-        if (n <= prongs_static) return for_each_static(n, function);
-
-        // Configure "fork" details
-        prong_index_t const prongs_dynamic = n - prongs_static;
-        fork_lambda_pointer_ = std::addressof(function);
-        fork_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
-        prongs_count_ = n;
-        prongs_progress_.store(0, std::memory_order_relaxed);
-        threads_to_sync_.store(threads_count_ - 1, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_release);      // ? Fence for the relaxed operations above
-        fork_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
-
-        // Execute on the current "main" thread
-        _worker_loop_for_dynamic_tasks(0, threads_count_, n);
-
-        // We may be in the in-flight position, where the current thread is already receiving
-        // tasks beyond the `prongs_count_` index, but the worker threads are still executing
-        // tasks and haven't decremented the `threads_to_sync_` variable yet.
-        while (threads_to_sync_.load(std::memory_order_acquire)) std::this_thread::yield();
-        assert(threads_to_sync_.load(std::memory_order_acquire) == 0);
-
-        // Optional reset of the task variables for debuggability
-        _reset_fork_description();
-    }
-
   private:
     void _reset_fork_description() noexcept {
-        prongs_count_ = 0;
         fork_lambda_pointer_ = nullptr;
         fork_trampoline_pointer_ = nullptr;
     }
@@ -460,9 +308,9 @@ class fork_union {
      *  @param[in] prong The index of the thread & task index packed together.
      */
     template <typename function_type_>
-    static void _call_lambda_from_thread(punned_fork_context_t punned_lambda_pointer, prong_t prong) noexcept {
-        auto const &lambda_object = *static_cast<function_type_ const *>(punned_lambda_pointer);
-        lambda_object(prong);
+    static void _call_as_lambda(punned_fork_context_t punned_lambda_pointer, thread_index_t thread_index) noexcept {
+        function_type_ const &lambda_object = *static_cast<function_type_ const *>(punned_lambda_pointer);
+        lambda_object(thread_index);
     }
 
     /**
@@ -484,54 +332,230 @@ class fork_union {
             if (wants_to_stop) [[unlikely]]
                 return;
 
-            // Check if we are operating in the "dynamic" eager mode or a balanced "static" mode
-            prong_index_t const prongs_count = prongs_count_;
-            thread_index_t const threads_count = threads_count_;
-            bool const is_static = prongs_count <= threads_count;
-            if (is_static) { fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, thread_index}); }
-            else { _worker_loop_for_dynamic_tasks(thread_index, threads_count, prongs_count); }
+            fork_trampoline_pointer_(fork_lambda_pointer_, thread_index);
             last_fork_generation = new_fork_generation;
 
             // ! The decrement must come after the task is executed
-            _FU_MAYBE_UNUSED prong_index_t const before_decrement =
+            _FU_MAYBE_UNUSED thread_index_t const before_decrement =
                 threads_to_sync_.fetch_sub(1, std::memory_order_release);
             assert(before_decrement > 0 && "We can't be here if there are no worker threads");
         }
     }
-
-    inline void _worker_loop_for_dynamic_tasks(thread_index_t const thread_index, thread_index_t const threads_count,
-                                               prong_index_t const prongs_count) noexcept {
-
-        // We will be calling the fork pointer a lot, so let's copy it into registers:
-        punned_fork_context_t const fork_lambda_pointer = fork_lambda_pointer_;
-        trampoline_pointer_t const fork_trampoline_pointer = fork_trampoline_pointer_;
-
-        // If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
-        // of computational time we will wrap around the `std::size_t` capacity for the `new_prong_index`.
-        // In case we `prongs_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
-        // Alternatively, we can make sure, that each thread can do at least one increment of `prongs_progress_`
-        // without worrying about the overflow. The way to achieve that is to preprocess the trailing `threads_count_`
-        // of elements externally, before entering this loop!
-        prong_index_t const prongs_dynamic = prongs_count - threads_count;
-        prong_index_t const one_static_prong_index = static_cast<prong_index_t>(prongs_dynamic + thread_index);
-        fork_trampoline_pointer(fork_lambda_pointer, {thread_index, one_static_prong_index});
-        assert((prongs_dynamic + threads_count) >= prongs_dynamic && "Overflow detected");
-
-        // Unlike the thread-balanced mode, we need to keep track of the number of passed tasks.
-        // The traditional way to achieve that is to use the same single atomic `threads_to_sync_`
-        // variable, but using `compare_exchange_weak` interfaces. It's much more expensive on modern
-        // CPUs, so we use an additional atomic variable and have 2x atomic increments of 2x atomic variables,
-        // instead of 1x atomic load and 1x atomic CAS on 1x atomic variable (in optimistic low-contention case).
-        while (true) {
-            prong_index_t const new_prong_index = prongs_progress_.fetch_add(1, std::memory_order_acq_rel);
-            bool const beyond_last_prong = new_prong_index >= prongs_dynamic;
-            if (beyond_last_prong) break;
-            fork_trampoline_pointer(fork_lambda_pointer, {thread_index, new_prong_index});
-        }
-    }
 };
 
-using fork_union_t = fork_union<std::allocator<std::thread>>;
+using thread_pool_t = thread_pool<std::allocator<std::thread>>;
+
+#pragma endregion - Thread Pool
+
+#pragma region - Indexed Tasks
+
+/**
+ *  @brief A "prong" - is a tip of a "fork" - describing a "thread" pinning a "task".
+ */
+template <typename index_type_ = std::size_t>
+struct prong {
+    using thread_index_t = index_type_; // ? A.k.a. "core index" or "thread ID" in [0, threads_count)
+    using task_index_t = index_type_;   // ? A.k.a. "task index" in [0, prongs_count)
+
+    thread_index_t thread_index {0};
+    task_index_t task_index {0};
+
+    inline prong() = default;
+    inline prong(prong const &) = default;
+    inline prong(prong &&) = default;
+    inline prong &operator=(prong const &) = default;
+    inline prong &operator=(prong &&) = default;
+
+    inline prong(thread_index_t thread, task_index_t task) noexcept : thread_index(thread), task_index(task) {}
+    inline operator task_index_t() const noexcept { return task_index; }
+};
+
+using prong_t = prong<>; // ? Default prong type with `std::size_t` indices
+
+/**
+ *  @brief Placeholder type for Parallel Algorithms.
+ */
+struct dummy_lambda_t {};
+
+/**
+ *  @brief Distributes @p (n) similar duration calls between threads in slices, as opposed to individual indices.
+ *
+ *  @param[in] pool The thread pool to use for parallel execution
+ *  @param[in] n The total length of the range to split between threads.
+ *  @param[in] function The callback, receiving @b `prong_t` or an unsigned integer and the slice length.
+ */
+template <                                                  //
+    typename allocator_type_ = std::allocator<std::thread>, //
+    typename index_type_ = std::size_t,                     //
+    std::size_t alignment_ = default_alignment_k,           //
+    typename function_type_ = dummy_lambda_t                //
+    >
+void for_slices(                                                 //
+    thread_pool<allocator_type_, index_type_, alignment_> &pool, //
+    std::size_t const n, function_type_ const &function) noexcept {
+
+    using pool_t = thread_pool<allocator_type_, index_type_, alignment_>;
+    using thread_index_t = typename pool_t::thread_index_t;
+    using index_t = index_type_;
+    using prong_t = prong<index_t>; // ? A.k.a. "task" = (thread_index, task_index)
+
+#if _FU_DETECT_CPP_17 // ? Having static asserts on C++17 this helps with saner compilation errors
+    // ? Exception handling and aggregating return values drastically increases code complexity
+    static_assert((std::is_nothrow_invocable_r<void, function_type_, prong_t, index_t>::value ||
+                   std::is_nothrow_invocable_r<void, function_type_, index_t, index_t>::value),
+                  "The callback must be invocable with a `prong_t` or a `index_t` argument and an unsigned counter");
+#endif
+
+    index_t const prongs_count = static_cast<index_t>(n);
+    if (prongs_count == 0) return;
+
+    // No need to slice the workload if we only have one thread
+    thread_index_t const threads_count = pool.threads_count();
+    if (threads_count == 1 || prongs_count == 1) return function(prong_t {0, 0}, prongs_count);
+
+    // Divide and round-up the workload size per thread - assuming some fuzzer may
+    // pass an absurdly large `prongs_count` as an input, the addition may overflow,
+    // so `(prongs_count + threads_count - 1) / threads_count` is not the safest option.
+    // Instead, we can do: `prongs_count / threads_count + (prongs_count % threads_count != 0)`,
+    // but avoiding the cost of the second integer division, replacing it with multiplication.
+    index_t const tasks_per_thread_lower_bound = prongs_count / threads_count;
+    index_t const tasks_per_thread =
+        tasks_per_thread_lower_bound + ((tasks_per_thread_lower_bound * threads_count) < prongs_count);
+
+    pool.broadcast([prongs_count, tasks_per_thread, tasks_per_thread_lower_bound,
+                    function](thread_index_t const thread_index) noexcept {
+        // Multiplying `thread_index` by `tasks_per_thread` may overflow. For an 8-bit `index_t` type:
+        // - 254 threads,
+        // - 255 tasks,
+        // - each thread gets 1 or 2 tasks
+        // In that case, both `begin` and `begin_lower_bound` will overflow, but we can use
+        // their relative values to determine the real slice length for the thread.
+        index_t const begin = thread_index * tasks_per_thread;                         // ? Handled overflow
+        index_t const begin_lower_bound = tasks_per_thread_lower_bound * thread_index; // ? Handled overflow
+        bool const begin_overflows = begin_lower_bound > begin;
+        bool const begin_exceeds_n = begin >= prongs_count;
+        if (begin_overflows || begin_exceeds_n) return;
+        index_t const count = (std::min<index_t>)(add_sat(begin, tasks_per_thread), prongs_count) - begin;
+        function(prong_t {thread_index, begin}, count);
+    });
+}
+
+/**
+ *  @brief Distributes @p (n) similar duration calls between threads.
+ *
+ *  @param[in] pool The thread pool to use for parallel execution.
+ *  @param[in] n The number of times to call the @p function.
+ *  @param[in] function The callback, receiving @b `prong_t` or a call index as an argument.
+ *
+ *  Is designed for a "balanced" workload, where all threads have roughly the same amount of work.
+ *  @sa `for_n_dynamic` for a more dynamic workload.
+ *  The @p function is called @p (n) times, and each thread receives a slice of consecutive tasks.
+ *  @sa `for_slices` if you prefer to receive workload slices over individual indices.
+ */
+template <                                                  //
+    typename allocator_type_ = std::allocator<std::thread>, //
+    typename index_type_ = std::size_t,                     //
+    std::size_t alignment_ = default_alignment_k,           //
+    typename function_type_ = dummy_lambda_t                //
+    >
+void for_n(                                                      //
+    thread_pool<allocator_type_, index_type_, alignment_> &pool, //
+    std::size_t const n, function_type_ const &function) noexcept {
+
+    using index_t = index_type_;
+    using prong_t = prong<index_t>; // ? A.k.a. "task" = (thread_index, task_index)
+
+    for_slices(pool, n, [function](prong_t const start_prong, index_t const count_prongs) noexcept {
+        for (index_t prong_offset = 0; prong_offset < count_prongs; ++prong_offset)
+            function(prong_t {start_prong.thread_index, static_cast<index_t>(start_prong.task_index + prong_offset)});
+    });
+}
+
+/**
+ *  @brief Executes uneven tasks on all threads, greedying for work.
+ *  @param[in] n The number of times to call the @p function.
+ *  @param[in] function The callback, receiving the `prong_t` or the task index as an argument.
+ *  @sa `for_n` for a more "balanced" evenly-splittable workload.
+ */
+template <                                                  //
+    typename allocator_type_ = std::allocator<std::thread>, //
+    typename index_type_ = std::size_t,                     //
+    std::size_t alignment_ = default_alignment_k,           //
+    typename function_type_ = dummy_lambda_t                //
+    >
+void for_n_dynamic(                                              //
+    thread_pool<allocator_type_, index_type_, alignment_> &pool, //
+    std::size_t const n, function_type_ const &function) noexcept {
+
+    using pool_t = thread_pool<allocator_type_, index_type_, alignment_>;
+    using thread_index_t = typename pool_t::thread_index_t;
+    using index_t = index_type_;
+    using prong_t = prong<index_t>; // ? A.k.a. "task" = (thread_index, prong_index)
+    static constexpr std::size_t alignment_k = pool_t::alignment_k;
+
+#if _FU_DETECT_CPP_17 // ? Having static asserts on C++17 this helps with saner compilation errors
+    // ? Exception handling and aggregating return values drastically increases code complexity
+    static_assert((std::is_nothrow_invocable_r<void, function_type_, prong_t>::value ||
+                   std::is_nothrow_invocable_r<void, function_type_, index_t>::value),
+                  "The callback must be invocable with a `prong_t` or a `index_t` argument");
+#endif
+
+    // No need to slice the work if there is just one task
+    index_t const prongs_count = static_cast<index_t>(n);
+    if (prongs_count == 0) return;
+    if (prongs_count == 1) return function(prong_t {0, 0});
+
+    // If there is just one thread, all work is done on the current thread
+    thread_index_t const threads_count = pool.threads_count();
+    if (threads_count == 1) {
+        for (index_t i = 0; i < prongs_count; ++i) function(prong_t {0, i});
+        return;
+    }
+
+    // If there are fewer tasks than threads, each thread gets at most 1 task
+    // and that's easier to schedule statically!
+    index_t const prongs_static = threads_count;
+    if (prongs_count <= prongs_static) return for_n(pool, prongs_count, function);
+
+    // Configure "fork" details
+    alignas(alignment_k) std::atomic<index_t> prongs_progress {0};
+    index_t const prongs_dynamic = prongs_count - prongs_static;
+    assert((prongs_dynamic + threads_count) >= prongs_dynamic && "Overflow detected");
+
+    // If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
+    // of computational time we will wrap around the `std::size_t` capacity for the `new_prong_index`.
+    // In case we `prongs_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
+    // Alternatively, we can make sure, that each thread can do at least one increment of `prongs_progress`
+    // without worrying about the overflow. The way to achieve that is to preprocess the trailing `threads_count`
+    // of elements externally, before entering this loop!
+    pool.broadcast(
+        [prongs_count, prongs_dynamic, function, &prongs_progress](thread_index_t const thread_index) noexcept {
+            // Run one static prong on the current thread
+            index_t const one_static_prong_index = static_cast<index_t>(prongs_dynamic + thread_index);
+            prong_t prong(thread_index, one_static_prong_index);
+            function(prong);
+
+            // The rest can be synchronized with a trivial atomic counter
+            while (true) {
+                prong.task_index = prongs_progress.fetch_add(1, std::memory_order_acq_rel);
+                bool const beyond_last_prong = prong.task_index >= prongs_dynamic;
+                if (beyond_last_prong) break;
+                function(prong);
+            }
+        });
+}
+
+#pragma endregion - Indexed Tasks
+
+#if defined(FU_ALLOW_UNSAFE)
+#pragma region - Unsafe Extensions
+template <typename function_type_>
+void unsafe_broadcast(function_type_ const &function) noexcept(false) {
+    std::exception_ptr exception_ptr;
+    std::atomic<thread_index_t> first_exception_thread_index;
+}
+#pragma endregion - Unsafe Extensions
+#endif
 
 } // namespace fork_union
 } // namespace ashvardanian

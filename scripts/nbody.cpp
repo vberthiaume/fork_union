@@ -90,32 +90,31 @@ void iteration_openmp_dynamic(std::span<body_t> bodies, std::span<vector3_t> for
 #endif
 }
 
-void iteration_fork_union_static(fun::fork_union_t &pool, std::span<body_t> bodies,
+void iteration_fork_union_static(fun::thread_pool_t &pool, std::span<body_t> bodies,
                                  std::span<vector3_t> forces) noexcept {
     std::size_t const n = bodies.size();
     body_t *bodies_ptr = bodies.data();
     vector3_t *forces_ptr = forces.data();
-    pool.for_each_static(n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept {
+    for_n(pool, n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept {
         vector3_t f {0.0, 0.0, 0.0};
         for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies_ptr[i], bodies_ptr[j]);
         forces_ptr[i] = f;
     });
-    pool.for_each_static(
-        n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
+    for_n(pool, n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
 }
 
-void iteration_fork_union_dynamic(fun::fork_union_t &pool, std::span<body_t> bodies,
+void iteration_fork_union_dynamic(fun::thread_pool_t &pool, std::span<body_t> bodies,
                                   std::span<vector3_t> forces) noexcept {
     std::size_t const n = bodies.size();
     body_t *bodies_ptr = bodies.data();
     vector3_t *forces_ptr = forces.data();
-    pool.for_each_dynamic(n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept {
+    for_n_dynamic(pool, n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept {
         vector3_t f {0.0, 0.0, 0.0};
         for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies_ptr[i], bodies_ptr[j]);
         forces_ptr[i] = f;
     });
-    pool.for_each_dynamic(
-        n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
+    for_n_dynamic(pool, n,
+                  [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
 }
 
 int main() {
@@ -132,18 +131,18 @@ int main() {
     std::vector<vector3_t> forces(n);
 
     // Random generators are quite slow, but let's hope this doesn't take too long
-    std::uniform_real_distribution<float> dist_pos(0.0, 1.0);
-    std::uniform_real_distribution<float> dist_mass(1e20, 1e25);
+    std::uniform_real_distribution<float> coordinate_distribution(0.0, 1.0);
+    std::uniform_real_distribution<float> mass_distribution(1e20, 1e25);
     std::random_device random_device;
     std::mt19937 random_gen(random_device());
     for (std::size_t i = 0; i < n; ++i) {
-        bodies[i].position.x = dist_pos(random_gen);
-        bodies[i].position.y = dist_pos(random_gen);
-        bodies[i].position.z = dist_pos(random_gen);
-        bodies[i].velocity.x = dist_pos(random_gen);
-        bodies[i].velocity.y = dist_pos(random_gen);
-        bodies[i].velocity.z = dist_pos(random_gen);
-        bodies[i].mass = dist_mass(random_gen);
+        bodies[i].position.x = coordinate_distribution(random_gen);
+        bodies[i].position.y = coordinate_distribution(random_gen);
+        bodies[i].position.z = coordinate_distribution(random_gen);
+        bodies[i].velocity.x = coordinate_distribution(random_gen);
+        bodies[i].velocity.y = coordinate_distribution(random_gen);
+        bodies[i].velocity.z = coordinate_distribution(random_gen);
+        bodies[i].mass = mass_distribution(random_gen);
     }
 
 #if defined(_OPENMP)
@@ -159,7 +158,7 @@ int main() {
 #endif
 
     // Every other configuration uses Fork Union
-    fun::fork_union_t pool;
+    fun::thread_pool_t pool;
     if (!pool.try_spawn(threads)) {
         std::fprintf(stderr, "Failed to spawn thread pool\n");
         return EXIT_FAILURE;
