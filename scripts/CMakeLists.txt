@@ -54,10 +54,13 @@ set_target_properties(
                CXX_STANDARD_REQUIRED ON
                CXX_EXTENSIONS OFF
 )
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(STATUS "Enabling OpenMP for fork_union_nbody")
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(STATUS "Enabling OpenMP for fork_union_nbody on GCC")
     target_compile_options(fork_union_nbody PRIVATE -fopenmp)
+    target_link_options(fork_union_nbody PRIVATE -fopenmp)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(STATUS "Enabling OpenMP for fork_union_nbody on Clang")
+    target_compile_options(fork_union_nbody PRIVATE -Xpreprocessor -fopenmp)
     target_link_options(fork_union_nbody PRIVATE -lomp)
-    target_compile_options(fork_union_nbody PRIVATE -Wunknown-attributes)
 endif ()
 set_target_properties_for_fork_union_script(fork_union_nbody)
