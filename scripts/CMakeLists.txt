@@ -8,11 +8,18 @@ function (set_target_properties_for_fork_union_script target_name)
         target_compile_options(${TGT} PRIVATE -O3)
     endif ()
 
-    # if we’re on GCC and not in Release, turn on TSAN here too
-    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT CMAKE_BUILD_TYPE STREQUAL "Release")
-        message(STATUS "Enabling ThreadSanitizer for ${TGT}")
-        target_compile_options(${TGT} PRIVATE -fsanitize=thread -g -O1)
-        target_link_options(${TGT} PRIVATE -fsanitize=thread)
+    # if we're not in Release mode
+    if (NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+        # if we're on GCC/Clang-compatible compiler and not in Release, turn on TSAN here too
+        if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+            OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+            OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"
+        )
+            message(STATUS "Enabling ThreadSanitizer for ${TGT}")
+            target_compile_options(${TGT} PRIVATE -g -O1)
+            target_compile_options(${TGT} PRIVATE -fsanitize=undefined,thread -fno-omit-frame-pointer)
+            target_link_options(${TGT} PRIVATE -fsanitize=undefined,thread)
+        endif ()
     endif ()
 endfunction ()
 
@@ -48,8 +55,9 @@ set_target_properties(
                CXX_EXTENSIONS OFF
 )
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(STATUS "Enabling OpenMP for fork_union_nbody via imported target")
+    message(STATUS "Enabling OpenMP for fork_union_nbody")
     target_compile_options(fork_union_nbody PRIVATE -fopenmp)
-    target_link_options(fork_union_nbody PRIVATE -fopenmp)
+    target_link_options(fork_union_nbody PRIVATE -lomp)
+    target_compile_options(fork_union_nbody PRIVATE -Wunknown-attributes)
 endif ()
 set_target_properties_for_fork_union_script(fork_union_nbody)
