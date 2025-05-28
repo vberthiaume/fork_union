@@ -91,6 +91,7 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *  support for atomic fence-less operations on Arm and IBM Power architectures. Most atomic counters
  *  use the "acquire-release" model, and some going further to "relaxed" model.
  *  @see https://en.cppreference.com/w/cpp/atomic/memory_order#Release-Acquire_ordering
+ *  @see https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2020/p2055r0.pdf
  *
  *  @section Usage
  *
@@ -138,10 +139,10 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *  @param index_type_ Defaults to `std::size_t`, but can be changed to a smaller type for debugging.
  *  @param alignment_ The alignment of the thread pool. Defaults to `default_alignment_k`.
  */
-template <                                                //
-    typename allocator_type_ = std::allocator<std::byte>, //
-    typename index_type_ = std::size_t,                   //
-    std::size_t alignment_ = default_alignment_k          //
+template <                                                  //
+    typename allocator_type_ = std::allocator<std::thread>, //
+    typename index_type_ = std::size_t,                     //
+    std::size_t alignment_ = default_alignment_k            //
     >
 class fork_union {
   public:
@@ -151,9 +152,9 @@ class fork_union {
     static_assert(std::is_unsigned<index_t>::value, "Index type must be an unsigned integer");
     static_assert(alignment_k > 0 && (alignment_k & (alignment_k - 1)) == 0, "Alignment must be a power of 2");
 
-    using thread_index_t = index_t;
-    using prong_index_t = index_t;
-    using generation_index_t = index_t;
+    using thread_index_t = index_t;     // A.k.a. "core index" or "thread ID" in [0, threads_count)
+    using prong_index_t = index_t;      // A.k.a. "task index" or "task ID" in the context of a task
+    using generation_index_t = index_t; // A.k.a. number of previous API calls in [0, UINT_MAX)
 
     /**
      *  @brief A POD-type describing a certain part of a parallel task.
@@ -161,6 +162,15 @@ class fork_union {
     struct prong_t {
         thread_index_t thread_index {0};
         prong_index_t prong_index {0};
+
+        inline prong_t() = default;
+        inline prong_t(prong_t const &) = default;
+        inline prong_t(prong_t &&) = default;
+        inline prong_t &operator=(prong_t const &) = default;
+        inline prong_t &operator=(prong_t &&) = default;
+
+        inline prong_t(thread_index_t const thread_index, prong_index_t const prong_index) noexcept
+            : thread_index(thread_index), prong_index(prong_index) {}
 
         inline operator prong_index_t() const noexcept { return prong_index; }
     };
@@ -171,6 +181,15 @@ class fork_union {
     struct c_callback_t {
         trampoline_pointer_t callable {nullptr};
         punned_fork_context_t context {nullptr};
+
+        inline c_callback_t() = default;
+        inline c_callback_t(c_callback_t const &) = default;
+        inline c_callback_t(c_callback_t &&) = default;
+        inline c_callback_t &operator=(c_callback_t const &) = default;
+        inline c_callback_t &operator=(c_callback_t &&) = default;
+
+        inline c_callback_t(trampoline_pointer_t const callable, punned_fork_context_t const context) noexcept
+            : callable(callable), context(context) {}
 
         inline void operator()(prong_t prong) const noexcept { callable(context, prong); }
     };
@@ -186,8 +205,8 @@ class fork_union {
     punned_fork_context_t fork_lambda_pointer_ {nullptr};    // ? Pointer to the users lambda
     trampoline_pointer_t fork_trampoline_pointer_ {nullptr}; // ? Calls the lambda
     prong_index_t prongs_count_ {0};
-    alignas(alignment_) std::atomic<prong_index_t> prongs_remaining_ {0};
-    alignas(alignment_) std::atomic<prong_index_t> prongs_passed_ {0}; // ? Only used in dynamic mode
+    alignas(alignment_) std::atomic<thread_index_t> threads_to_sync_ {0};
+    alignas(alignment_) std::atomic<prong_index_t> prongs_progress_ {0}; // ? Only used in dynamic mode
     alignas(alignment_) std::atomic<generation_index_t> fork_generation_ {0};
 
   public:
@@ -211,8 +230,8 @@ class fork_union {
         if (planned_threads == 0) return false; // ! Can't have zero threads working on something
         if (threads_count_ != 0) return false;  // ! Already initialized
         if (planned_threads == 1) {
-            threads_count_ = 1; // ! The current thread will always be used
-            return true;
+            threads_count_ = 1;
+            return true; // ! The current thread will always be used
         }
 
         // Allocate the thread pool
@@ -245,9 +264,12 @@ class fork_union {
      *  @note Can't be called while any tasks are running.
      */
     void stop_and_reset() noexcept {
-        if (threads_count_ == 0) return;                                // ? Uninitialized
-        if (threads_count_ == 1) return;                                // ? No worker threads to join
-        assert(prongs_remaining_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
+        if (threads_count_ == 0) return; // ? Uninitialized
+        if (threads_count_ == 1) {
+            threads_count_ = 0;
+            return; // ? No worker threads to join
+        }
+        assert(threads_to_sync_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
 
         // Stop all threads and wait for them to finish
         _reset_fork_description();
@@ -358,14 +380,14 @@ class fork_union {
         fork_lambda_pointer_ = std::addressof(function);
         fork_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
         prongs_count_ = threads_count_;
-        prongs_remaining_.store(threads_count_ - 1, std::memory_order_relaxed);
+        threads_to_sync_.store(threads_count_ - 1, std::memory_order_relaxed);
         fork_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current "main" thread
         function(0);
 
         // Wait until all threads are done
-        while (prongs_remaining_.load(std::memory_order_acquire)) std::this_thread::yield();
+        while (threads_to_sync_.load(std::memory_order_acquire)) std::this_thread::yield();
 
         // An optional reset of the task variables for debuggability
         _reset_fork_description();
@@ -399,28 +421,27 @@ class fork_union {
 
         // If there are fewer tasks than threads, each thread gets at most 1 task
         // and that's easier to schedule statically!
-        prong_index_t const min_static_suffix_size = threads_count_;
-        if (n <= min_static_suffix_size) return for_each_static(n, function);
+        prong_index_t const prongs_static = threads_count_;
+        if (n <= prongs_static) return for_each_static(n, function);
 
         // Configure "fork" details
-        prong_index_t const n_without_suffix = n - min_static_suffix_size;
+        prong_index_t const prongs_dynamic = n - prongs_static;
         fork_lambda_pointer_ = std::addressof(function);
         fork_trampoline_pointer_ = &_call_lambda_from_thread<function_type_>;
         prongs_count_ = n;
-        prongs_passed_.store(0, std::memory_order_relaxed);
-        prongs_remaining_.store(n, std::memory_order_relaxed);
+        prongs_progress_.store(0, std::memory_order_relaxed);
+        threads_to_sync_.store(threads_count_ - 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);      // ? Fence for the relaxed operations above
         fork_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
-        // Execute on the current "main" thread, assuming the last `threads_count_` will
-        // be handled separately to avoid overflow in the dynamic worker loop.
-        fork_trampoline_pointer_(fork_lambda_pointer_, {0, n_without_suffix});
-        prongs_remaining_.fetch_sub(1, std::memory_order_release);
-        _worker_loop_for_dynamic_tasks(0, n_without_suffix);
+        // Execute on the current "main" thread
+        _worker_loop_for_dynamic_tasks(0, threads_count_, n);
 
         // We may be in the in-flight position, where the current thread is already receiving
         // tasks beyond the `prongs_count_` index, but the worker threads are still executing
-        // tasks and haven't decremented the `prongs_remaining_` variable yet.
-        while (prongs_remaining_.load(std::memory_order_acquire)) std::this_thread::yield();
+        // tasks and haven't decremented the `threads_to_sync_` variable yet.
+        while (threads_to_sync_.load(std::memory_order_acquire)) std::this_thread::yield();
+        assert(threads_to_sync_.load(std::memory_order_acquire) == 0);
 
         // Optional reset of the task variables for debuggability
         _reset_fork_description();
@@ -460,57 +481,52 @@ class fork_union {
                    (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
                 std::this_thread::yield();
 
-            if (wants_to_stop) return;
+            if (wants_to_stop) [[unlikely]]
+                return;
 
             // Check if we are operating in the "dynamic" eager mode or a balanced "static" mode
             prong_index_t const prongs_count = prongs_count_;
-            bool const is_static = prongs_count == threads_count_;
-            if (is_static) {
-                fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, thread_index});
-                // ! The decrement must come after the task is executed
-                _FU_MAYBE_UNUSED prong_index_t const before_decrement =
-                    prongs_remaining_.fetch_sub(1, std::memory_order_release);
-                assert(before_decrement > 0 && "We can't be here if there are no worker threads");
-            }
-            else {
-                // Execute one task per thread separately to avoid possible overflow in the dynamic worker loop
-                prong_index_t const n_without_suffix = prongs_count - threads_count_;
-                fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, n_without_suffix + thread_index});
-                prongs_remaining_.fetch_sub(1, std::memory_order_release);
-                _worker_loop_for_dynamic_tasks(thread_index, n_without_suffix);
-            }
+            thread_index_t const threads_count = threads_count_;
+            bool const is_static = prongs_count <= threads_count;
+            if (is_static) { fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, thread_index}); }
+            else { _worker_loop_for_dynamic_tasks(thread_index, threads_count, prongs_count); }
             last_fork_generation = new_fork_generation;
+
+            // ! The decrement must come after the task is executed
+            _FU_MAYBE_UNUSED prong_index_t const before_decrement =
+                threads_to_sync_.fetch_sub(1, std::memory_order_release);
+            assert(before_decrement > 0 && "We can't be here if there are no worker threads");
         }
     }
 
-    void _worker_loop_for_dynamic_tasks(thread_index_t const thread_index, prong_index_t const prongs_count) noexcept {
+    inline void _worker_loop_for_dynamic_tasks(thread_index_t const thread_index, thread_index_t const threads_count,
+                                               prong_index_t const prongs_count) noexcept {
+
+        // We will be calling the fork pointer a lot, so let's copy it into registers:
+        punned_fork_context_t const fork_lambda_pointer = fork_lambda_pointer_;
+        trampoline_pointer_t const fork_trampoline_pointer = fork_trampoline_pointer_;
 
         // If we run this loop at 1 Billion times per second on a 64-bit machine, then every 585 years
         // of computational time we will wrap around the `std::size_t` capacity for the `new_prong_index`.
         // In case we `prongs_count + thread_index >= std::size_t(-1)`, a simple condition won't be enough.
-        // Alternatively, we can make sure, that each thread can do at least one increment of `prongs_passed_`
+        // Alternatively, we can make sure, that each thread can do at least one increment of `prongs_progress_`
         // without worrying about the overflow. The way to achieve that is to preprocess the trailing `threads_count_`
         // of elements externally, before entering this loop!
-        assert((prongs_count + threads_count_) >= prongs_count); // ? Detects overflow
+        prong_index_t const prongs_dynamic = prongs_count - threads_count;
+        prong_index_t const one_static_prong_index = static_cast<prong_index_t>(prongs_dynamic + thread_index);
+        fork_trampoline_pointer(fork_lambda_pointer, {thread_index, one_static_prong_index});
+        assert((prongs_dynamic + threads_count) >= prongs_dynamic && "Overflow detected");
 
         // Unlike the thread-balanced mode, we need to keep track of the number of passed tasks.
-        // The traditional way to achieve that is to use the same single atomic `prongs_remaining_`
+        // The traditional way to achieve that is to use the same single atomic `threads_to_sync_`
         // variable, but using `compare_exchange_weak` interfaces. It's much more expensive on modern
         // CPUs, so we use an additional atomic variable and have 2x atomic increments of 2x atomic variables,
         // instead of 1x atomic load and 1x atomic CAS on 1x atomic variable (in optimistic low-contention case).
         while (true) {
-
-            // The relative order of executed tasks doesn't matter here, so we can use relaxed memory order.
-            prong_index_t const new_prong_index = prongs_passed_.fetch_add(1, std::memory_order_relaxed);
-            bool const beyond_last_prong = new_prong_index >= prongs_count;
+            prong_index_t const new_prong_index = prongs_progress_.fetch_add(1, std::memory_order_acq_rel);
+            bool const beyond_last_prong = new_prong_index >= prongs_dynamic;
             if (beyond_last_prong) break;
-
-            fork_trampoline_pointer_(fork_lambda_pointer_, {thread_index, new_prong_index});
-            // ! The decrement must come after the task is executed, as our main thread is waiting
-            // ! for that counter to reach zero, to exit the current scope.
-            _FU_MAYBE_UNUSED prong_index_t const before_decrement =
-                prongs_remaining_.fetch_sub(1, std::memory_order_release);
-            assert(before_decrement > 0 && "We can't be here if there are no tasks left");
+            fork_trampoline_pointer(fork_lambda_pointer, {thread_index, new_prong_index});
         }
     }
 };
