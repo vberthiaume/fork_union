@@ -44,11 +44,13 @@
 
 #include <fork_union.hpp>
 
+namespace fun = ashvardanian::fork_union;
+
+#pragma region - Shared Logic
+
 static constexpr float g_const = 6.674e-11;
 static constexpr float dt_const = 0.01;
 static constexpr float softening_const = 1e-9;
-
-namespace fun = ashvardanian::fork_union;
 
 struct vector3_t {
     float x, y, z;
@@ -95,6 +97,10 @@ inline void apply_force(body_t &bi, vector3_t const &f) noexcept {
     bi.position.y += bi.velocity.y * dt_const;
     bi.position.z += bi.velocity.z * dt_const;
 }
+
+#pragma endregion - Shared Logic
+
+#pragma region - Backends
 
 void iteration_openmp_static(std::span<body_t> bodies, std::span<vector3_t> forces) noexcept {
 #if defined(_OPENMP)
@@ -151,10 +157,12 @@ void iteration_fork_union_dynamic(fun::thread_pool_t &pool, std::span<body_t> bo
                   [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
 }
 
+#pragma endregion - Backends
+
 int main() {
     // Read env vars
     std::size_t n = std::stoul(std::getenv("NBODY_COUNT") ?: "0");
-    std::size_t const iterations = std::stoul(std::getenv("NBODY_ITERATIONS") ?: "1");
+    std::size_t const iterations = std::stoul(std::getenv("NBODY_ITERATIONS") ?: "1000");
     std::string_view const backend = std::getenv("NBODY_BACKEND") ? std::getenv("NBODY_BACKEND") : "fork_union_static";
     std::size_t threads = std::stoul(std::getenv("NBODY_THREADS") ?: "0");
     if (threads == 0) threads = std::thread::hardware_concurrency();
