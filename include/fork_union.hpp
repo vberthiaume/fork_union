@@ -579,15 +579,5 @@ void for_n_dynamic(                                              //
 
 #pragma endregion - Indexed Tasks
 
-#if defined(FU_ALLOW_UNSAFE)
-#pragma region - Unsafe Extensions
-template <typename function_type_>
-void unsafe_broadcast(function_type_ const &function) noexcept(false) {
-    std::exception_ptr exception_ptr;
-    std::atomic<thread_index_t> first_exception_thread_index;
-}
-#pragma endregion - Unsafe Extensions
-#endif
-
 } // namespace fork_union
 } // namespace ashvardanian
