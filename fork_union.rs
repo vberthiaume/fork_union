@@ -461,7 +461,7 @@ where
         };
         function(prong);
         loop {
-            let idx = progress.fetch_add(1, Ordering::AcqRel);
+            let idx = progress.fetch_add(1, Ordering::Relaxed);
             if idx >= prongs_dynamic {
                 break;
             }

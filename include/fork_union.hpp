@@ -569,7 +569,7 @@ void for_n_dynamic(                                              //
 
             // The rest can be synchronized with a trivial atomic counter
             while (true) {
-                prong.task_index = prongs_progress.fetch_add(1, std::memory_order_acq_rel);
+                prong.task_index = prongs_progress.fetch_add(1, std::memory_order_relaxed);
                 bool const beyond_last_prong = prong.task_index >= prongs_dynamic;
                 if (beyond_last_prong) break;
                 function(prong);
