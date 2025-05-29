@@ -152,7 +152,8 @@ That's it.
 
 There are many other thread-pool implementations, that are more feature-rich, but have different limitations and design goals.
 
-- C++: [`taskflow/taskflow`](https://github.com/taskflow/taskflow), [`progschj/ThreadPool`](https://github.com/progschj/ThreadPool), [`bshoshany/thread-pool`](https://github.com/bshoshany/thread-pool), [`vit-vit/CTPL`](https://github.com/vit-vit/CTPL), [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool)
+- Modern C++: [`taskflow/taskflow`](https://github.com/taskflow/taskflow), [`progschj/ThreadPool`](https://github.com/progschj/ThreadPool), [`bshoshany/thread-pool`](https://github.com/bshoshany/thread-pool)
+- Traditional C++: [`vit-vit/CTPL`](https://github.com/vit-vit/CTPL), [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool)
 - Rust: [`tokio-rs/tokio`](https://github.com/tokio-rs/tokio), [`rayon-rs/rayon`](https://github.com/rayon-rs/rayon), [`smol-rs/smol`](https://github.com/smol-rs/smol)
 
 Those are not designed for the same OpenMP-like use-cases as __`fork_union`__.
@@ -206,68 +207,55 @@ In that case, even on x86, where the entire cache will be exclusively owned by a
 
 ## Performance
 
-One of the most common parallel workloads is the N-body simulation.
+One of the most common parallel workloads is the N-body simulation ¹.
 An implementation is available in both C++ and Rust in `scripts/nbody.cpp` and `scripts/nbody.rs` respectively.
 Both are extremely light-weight and involve little logic outside of number-crunching, so both can be easily profiled with `time` and introspected with `perf` Linux tools. 
 
-> Another common workload is [Parallel Reductions](https://github.com/ashvardanian/ParallelReductionsBenchmark).
+---
 
-### C++ Benchmarks
-
-For $N=128$ bodies, $I=1e6$ iterations, using the maximum number of threads available on the machine, the numbers are as follows:
+C++ benchmarking results for $N=128$ bodies and $I=1e6$ iterations:
 
 | Machine        | OpenMP (D) | OpenMP (S) | Fork Union (D) | Fork Union (S) |
 | :------------- | ---------: | ---------: | -------------: | -------------: |
 | 16x Intel SPR  |      20.3s |      16.0s |          18.1s |          10.3s |
-| 12x Apple M2   |          ? |      76.7s |        90.3s ¹ |       100.7s ¹ |
-| 96x Graviton 4 |      32.2s |      20.8s |           41.2 |          26.0s |
+| 12x Apple M2   |          ? |   1m:16.7s |     1m:30.3s ² |     1m:40.7s ² |
+| 96x Graviton 4 |      32.2s |      20.8s |          39.8s |          26.0s |
 
-> ¹ When a combination of performance and efficiency cores is used, dynamic stealing may be more efficient than static slicing.
+Rust benchmarking results for $N=128$ bodies and $I=1e6$ iterations:
 
-### Rust Benchmarks
+| Machine        | Rayon (D) | Rayon (S) | Fork Union (D) | Fork Union (S) |
+| :------------- | --------: | --------: | -------------: | -------------: |
+| 16x Intel SPR  |     51.4s |     38.1s |          15.9s |           9.8s |
+| 12x Apple M2   |  3m:23.5s |   2m:0.6s |        4m:8.4s |       1m:20.8s |
+| 96x Graviton 4 |  2m:13.9s |  1m:35.6s |          18.9s |          10.1s |
 
-For $N=128$ bodies, $I=1e6$ iterations, using the maximum number of threads available on the machine, the numbers are as follows:
-
-| Machine       | Tokio | Rayon | Fork Union (D) | Fork Union (S) |
-| :------------ | ----: | ----: | -------------: | -------------: |
-| 16x Intel SPR |       |       |                |                |
+> ¹ Another common workload is "Parallel Reductions" covered in a separate [repository](https://github.com/ashvardanian/ParallelReductionsBenchmark).
+> ² When a combination of performance and efficiency cores is used, dynamic stealing may be more efficient than static slicing.
 
 ## Safety & Logic
 
-There are only 4 atomic variables in this thread-pool, and some of them are practically optional.
-Let's call every invocation of `for_each_*` a "fork", and every exit from it a "join".
+There are only 3 core atomic variables in this thread-pool, and some of them are practically optional.
+Let's call every invocation of a `for_*` API - a "fork", and every exit from it a "join".
 
-| Variable           | Users Perspective                   | Internal Usage                          |
-| :----------------- | :---------------------------------- | :-------------------------------------- |
-| `stop`             | Stop the entire thread-pool         | Tells workers when to exit the loop     |
-| `fork_generation`  | How many "forks" have been finished | Tells workers to wake up on new "forks" |
-| `prongs_remaining` | Number of tasks left in this "fork" | Tells main thread when workers finish   |
-| `prongs_passed`    | Number of tasks done in this "fork" | Helps balance work in "dynamic" mode    |
+| Variable          | Users Perspective            | Internal Usage                        |
+| :---------------- | :--------------------------- | :------------------------------------ |
+| `stop`            | Stop the entire thread-pool  | Tells workers when to exit the loop   |
+| `fork_generation` | "Forks" called since init    | Tells workers to wake up on new forks |
+| `threads_to_sync` | Threads not joined this fork | Tells main thread when workers finish |
 
-__Why use `prongs_remaining` and `prongs_passed`?__
-When greedily stealing tasks from each other, we need to:
-
-1. Poll an incomplete task index.
-2. Execute the task.
-3. Mark the task as completed.
-
-Trivial, but we can't do 3 before we do 2, as otherwise, the calling thread will exit too early, and we will face Undefined Behavior.
-Using two atomic variables our task polling becomes largely independent of the task completion.
-Moreover, we don't need to enforce the strictest memory ordering rules for `prongs_passed`.
-
-__Why don't we need atomics for `total_threads`?__
+__Why don't we need atomics for "total_threads"?__
 The only way to change the number of threads is to `stop_and_reset` the entire thread-pool and then `try_spawn` it again.
 Either of those operations can only be called from one thread at a time and never coincides with any running tasks.
 That's ensured by the `stop`.
 
-__Why don't we need atomics for `task_parts` and `task_pointer`?__
-A new task can only be submitted from one thread, that updates the number of parts for each new "fork".
+__Why don't we need atomics for a "job pointer"?__
+A new task can only be submitted from one thread, that updates the number of parts for each new fork.
 During that update, the workers are asleep, spinning on old values of `fork_generation` and `stop`.
 They only wake up and access the new value once `fork_generation` increments, ensuring safety.
 
 __How do we deal with overflows and `SIZE_MAX`-sized tasks?__
 The library entirely avoids saturating multiplication and only uses one saturating addition in "release" builds.
-To test the consistency of arithmetic, the C++ template class can be instantiated with a custom `index_type_t`, such as `std::uint8_t` or `std::uint16_t`.
+To test the consistency of arithmetic, the C++ template class can be instantiated with a custom `index_t`, such as `std::uint8_t` or `std::uint16_t`.
 In the former case, no more than 255 threads can operate and no more than 255 tasks can be addressed, allowing us to easily test every weird corner case of [0:255] threads competing for [0:255] tasks.
 
 ## Testing and Benchmarking
