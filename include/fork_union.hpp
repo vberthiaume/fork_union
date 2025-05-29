@@ -7,7 +7,8 @@
  *  Fork Union provides a minimalistic cross-platform thread-pool implementation and Parallel Algorithms,
  *  avoiding dynamic memory allocations, exceptions, system calls, and heavy Compare-And-Swap instructions.
  *  The library leverages the "weak memory model" to allow Arm and IBM Power CPUs to aggressively optimize
- *  optimize execution at runtime. It's compatible with C++11 and later.
+ *  optimize execution at runtime. It's compatible with C++11 and later. It also aggressively tests against
+ *  overflows on smaller index types, and is safe to use even with the maximal `std::size_t` values.
  *
  *  @code{.cpp}
  *  #include <cstdio> // `std::printf`
@@ -21,8 +22,8 @@
  *      if (!pool.try_spawn(std::thread::hardware_concurrency()))
  *          return EXIT_FAILURE;
  *
- *      fu::for_n(pool, argc, [](auto prong) {
- *          auto const [thread_index, task_index] = prong;
+ *      fu::for_n(pool, argc, [](auto prong) noexcept {
+ *          auto [thread_index, task_index] = prong;
  *          std::printf(
  *              "Printing argument %zu from thread %zu: %s\n",
  *              task_index, thread_index, argv[task_index]);
@@ -31,9 +32,7 @@
  *  }
  *  @endcode
  *
- *  Sever
- *  Parallel Algorithms, similar to the C++ Standard Library's `std::for_each`, `std::transform`, etc.,
- *  are provided, including:
+ *  The next layer of logic is for basic index-addressable tasks. It includes basic parallel loops:
  *
  *  - `for_n` - for iterating over a range of similar duration tasks, addressable by an index.
  *  - `for_n_dynamic` - for unevenly distributed tasks, where each task may take a different time.
@@ -116,6 +115,7 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *  - @b copy/move: the threads depend on the address of the parent structure.
  *  - handle @b exceptions: you must `try-catch` them yourself and return `void`.
  *  - @b stop early: assuming the user can do it better, knowing the task granularity.
+ *  - @b overflow: as all APIs are aggressively tested with smaller index types.
  *
  *  This allows this thread-pool to be extremely lightweight and fast, with no heap allocations
  *  and no expensive abstractions. It only uses `std::thread` and `std::atomic`, but avoids
@@ -174,6 +174,13 @@ class thread_pool {
     allocator_t allocator_ {};
     std::thread *workers_ {nullptr};
     thread_index_t threads_count_ {0};
+
+    /**
+     *  Theoretically, the choice of `std::atomic<bool>` is suboptimal in the presence of `std::atomic_flag`.
+     *  The latter is guaranteed to be lock-free, while the former is not. But until C++20, the flag doesn't
+     *  have a non-modifying load operation - the `std::atomic_flag::test` was added in C++20.
+     *  @see https://en.cppreference.com/w/cpp/atomic/atomic_flag.html
+     */
     alignas(alignment_) std::atomic<bool> stop_ {false};
 
     // Task-specific variables:
@@ -190,7 +197,21 @@ class thread_pool {
 
     thread_pool(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
     ~thread_pool() noexcept { stop_and_reset(); }
-    thread_index_t threads_count() const noexcept { return threads_count_; }
+
+    /**
+     *  @brief Returns the number of threads in the thread-pool, including the main thread.
+     *  @retval 0 if the thread-pool is not initialized, 1 if only the main thread is used.
+     *  @note This API is not synchronized and is expected to be called only from the main thread.
+     */
+    thread_index_t threads() const noexcept { return threads_count_; }
+
+    /** @brief Estimates the amount of memory managed by this pool handle and internal structures. */
+    std::size_t memory_usage() const noexcept { return sizeof(thread_pool) + threads() * sizeof(std::thread); }
+
+    /** @brief Checks if the thread-pool's core synchronization points are lock-free. */
+    bool is_lock_free() const noexcept {
+        return stop_.is_lock_free() && threads_to_sync_.is_lock_free() && fork_generation_.is_lock_free();
+    }
 
     /**
      *  @brief Creates a thread-pool with the given number of threads.
@@ -210,7 +231,7 @@ class thread_pool {
         // Allocate the thread pool
         thread_index_t const worker_threads = planned_threads - 1;
         std::thread *const workers = allocator_.allocate(worker_threads);
-        if (workers == nullptr) return false; // ! Allocation failed
+        if (!workers) return false; // ! Allocation failed
 
         // Initialize the thread pool can fail for all kinds of reasons,
         // that the `std::thread` documentation describes as "implementation-defined".
@@ -270,8 +291,9 @@ class thread_pool {
      */
     template <typename function_type_>
     void broadcast(function_type_ const &function) noexcept {
-        assert(threads_count_ != 0 && "Thread pool not initialized");
-        if (threads_count_ == 1) return function(static_cast<thread_index_t>(0));
+        thread_index_t const threads_count = threads();
+        assert(threads_count != 0 && "Thread pool not initialized");
+        if (threads_count == 1) return function(static_cast<thread_index_t>(0));
 
 #if _FU_DETECT_CPP_17
         // ? Exception handling and aggregating return values drastically increases code complexity
@@ -283,7 +305,7 @@ class thread_pool {
         // Configure "fork" details
         fork_lambda_pointer_ = std::addressof(function);
         fork_trampoline_pointer_ = &_call_as_lambda<function_type_>;
-        threads_to_sync_.store(threads_count_ - 1, std::memory_order_relaxed);
+        threads_to_sync_.store(threads_count - 1, std::memory_order_relaxed);
         fork_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current "main" thread
@@ -410,7 +432,7 @@ void for_slices(                                                 //
     if (prongs_count == 0) return;
 
     // No need to slice the workload if we only have one thread
-    thread_index_t const threads_count = pool.threads_count();
+    thread_index_t const threads_count = pool.threads();
     if (threads_count == 1 || prongs_count == 1) return function(prong_t {0, 0}, prongs_count);
 
     // Divide and round-up the workload size per thread - assuming some fuzzer may
@@ -506,7 +528,7 @@ void for_n_dynamic(                                              //
     if (prongs_count == 1) return function(prong_t {0, 0});
 
     // If there is just one thread, all work is done on the current thread
-    thread_index_t const threads_count = pool.threads_count();
+    thread_index_t const threads_count = pool.threads();
     if (threads_count == 1) {
         for (index_t i = 0; i < prongs_count; ++i) function(prong_t {0, i});
         return;
