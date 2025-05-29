@@ -46,6 +46,12 @@
 
 namespace fun = ashvardanian::fork_union;
 
+#if defined(__GNUC__) || defined(__clang__)
+#define _FU_RESTRICT __restrict__
+#else
+#define _FU_RESTRICT
+#endif
+
 #pragma region - Shared Logic
 
 static constexpr float g_const = 6.674e-11;
@@ -102,9 +108,8 @@ inline void apply_force(body_t &bi, vector3_t const &f) noexcept {
 
 #pragma region - Backends
 
-void iteration_openmp_static(std::span<body_t> bodies, std::span<vector3_t> forces) noexcept {
+void iteration_openmp_static(body_t *_FU_RESTRICT bodies, vector3_t *_FU_RESTRICT forces, std::size_t n) noexcept {
 #if defined(_OPENMP)
-    std::size_t const n = bodies.size();
 #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < n; ++i) {
         vector3_t f {0.0, 0.0, 0.0};
@@ -116,9 +121,8 @@ void iteration_openmp_static(std::span<body_t> bodies, std::span<vector3_t> forc
 #endif
 }
 
-void iteration_openmp_dynamic(std::span<body_t> bodies, std::span<vector3_t> forces) noexcept {
+void iteration_openmp_dynamic(body_t *_FU_RESTRICT bodies, vector3_t *_FU_RESTRICT forces, std::size_t n) noexcept {
 #if defined(_OPENMP)
-    std::size_t const n = bodies.size();
 #pragma omp parallel for schedule(dynamic, 1)
     for (std::size_t i = 0; i < n; ++i) {
         vector3_t f {0.0, 0.0, 0.0};
@@ -130,31 +134,24 @@ void iteration_openmp_dynamic(std::span<body_t> bodies, std::span<vector3_t> for
 #endif
 }
 
-void iteration_fork_union_static(fun::thread_pool_t &pool, std::span<body_t> bodies,
-                                 std::span<vector3_t> forces) noexcept {
-    std::size_t const n = bodies.size();
-    body_t *bodies_ptr = bodies.data();
-    vector3_t *forces_ptr = forces.data();
-    for_n(pool, n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept {
+void iteration_fork_union_static(fun::thread_pool_t &pool, body_t *_FU_RESTRICT bodies, vector3_t *_FU_RESTRICT forces,
+                                 std::size_t n) noexcept {
+    for_n(pool, n, [=](std::size_t i) noexcept {
         vector3_t f {0.0, 0.0, 0.0};
-        for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies_ptr[i], bodies_ptr[j]);
-        forces_ptr[i] = f;
+        for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies[i], bodies[j]);
+        forces[i] = f;
     });
-    for_n(pool, n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
+    for_n(pool, n, [=](std::size_t i) noexcept { apply_force(bodies[i], forces[i]); });
 }
 
-void iteration_fork_union_dynamic(fun::thread_pool_t &pool, std::span<body_t> bodies,
-                                  std::span<vector3_t> forces) noexcept {
-    std::size_t const n = bodies.size();
-    body_t *bodies_ptr = bodies.data();
-    vector3_t *forces_ptr = forces.data();
-    for_n_dynamic(pool, n, [n, bodies_ptr, forces_ptr](std::size_t i) noexcept {
+void iteration_fork_union_dynamic(fun::thread_pool_t &pool, body_t *_FU_RESTRICT bodies, vector3_t *_FU_RESTRICT forces,
+                                  std::size_t n) noexcept {
+    for_n_dynamic(pool, n, [=](std::size_t i) noexcept {
         vector3_t f {0.0, 0.0, 0.0};
-        for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies_ptr[i], bodies_ptr[j]);
-        forces_ptr[i] = f;
+        for (std::size_t j = 0; j < n; ++j) f += gravitational_force(bodies[i], bodies[j]);
+        forces[i] = f;
     });
-    for_n_dynamic(pool, n,
-                  [n, bodies_ptr, forces_ptr](std::size_t i) noexcept { apply_force(bodies_ptr[i], forces_ptr[i]); });
+    for_n_dynamic(pool, n, [=](std::size_t i) noexcept { apply_force(bodies[i], forces[i]); });
 }
 
 #pragma endregion - Backends
@@ -190,11 +187,11 @@ int main() {
 #if defined(_OPENMP)
     omp_set_num_threads(static_cast<int>(threads));
     if (backend == "openmp_static") {
-        for (std::size_t i = 0; i < iterations; ++i) iteration_openmp_static(bodies, forces);
+        for (std::size_t i = 0; i < iterations; ++i) iteration_openmp_static(bodies.data(), forces.data(), n);
         return EXIT_SUCCESS;
     }
     if (backend == "openmp_dynamic") {
-        for (std::size_t i = 0; i < iterations; ++i) iteration_openmp_dynamic(bodies, forces);
+        for (std::size_t i = 0; i < iterations; ++i) iteration_openmp_dynamic(bodies.data(), forces.data(), n);
         return EXIT_SUCCESS;
     }
 #endif
@@ -207,11 +204,12 @@ int main() {
     }
 
     if (backend == "fork_union_static") {
-        for (std::size_t i = 0; i < iterations; ++i) iteration_fork_union_static(pool, bodies, forces);
+        for (std::size_t i = 0; i < iterations; ++i) iteration_fork_union_static(pool, bodies.data(), forces.data(), n);
         return EXIT_SUCCESS;
     }
     if (backend == "fork_union_dynamic") {
-        for (std::size_t i = 0; i < iterations; ++i) iteration_fork_union_dynamic(pool, bodies, forces);
+        for (std::size_t i = 0; i < iterations; ++i)
+            iteration_fork_union_dynamic(pool, bodies.data(), forces.data(), n);
         return EXIT_SUCCESS;
     }
 
