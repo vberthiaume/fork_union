@@ -46,7 +46,11 @@
 #include <cassert> // `assert`
 #include <new>     // `std::hardware_destructive_interference_size`
 
-#if defined(FU_ALLOW_UNSAFE)
+#if !defined(FU_ALLOW_UNSAFE)
+#define FU_ALLOW_UNSAFE 0
+#endif
+
+#if FU_ALLOW_UNSAFE
 #include <exception> // `std::exception_ptr`
 #endif
 
