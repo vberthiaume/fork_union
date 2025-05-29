@@ -1,4 +1,4 @@
-# Fork Union
+# Fork Union 🍴
 
 The __`fork_union`__ library is a thread-pool for "Fork-Join" [SIMT-style](https://en.wikipedia.org/wiki/Single_instruction,_multiple_threads) parallelism for Rust and C++.
 It's quite different from most open-source thread-pool implementations, generally designed around heap-allocated "queues of tasks", synchronized by a "mutex".
@@ -14,18 +14,14 @@ This is where __`fork_union`__ comes in with a minimalistic STL implementation o
 
 ## Usage
 
-The __`fork_union`__ supports just 2 operation modes:
-
-- __"Static"__ - even slicing for tasks with uniform cost.
-- __"Dynamic"__ - work-stealing for uneven workloads.
-
+The __`fork_union`__ is dead-simple!
 There is no nested parallelism, exception-handling, or "futures promises".
-Only 4 simple APIs:
+The thread pool has just one core API - `broadcast` to launch a callback on each thread.
+The higher-level API for index-addressable tasks are:
 
-- `for_each_thread` - to dispatch a callback per thread.
-- `for_each_static` - for individual evenly-sized tasks.
-- `for_each_slice` - for slices of evenly-sized tasks.
-- `for_each_dynamic` - for individual unevenly-sized tasks.
+- `for_n` - for individual evenly-sized tasks.
+- `for_n_dynamic` - for individual unevenly-sized tasks.
+- `for_slices` - for slices of evenly-sized tasks.
 
 Both are available in C++ and Rust.
 
@@ -34,21 +30,28 @@ Both are available in C++ and Rust.
 A minimal example may look like this:
 
 ```rs
-use fork_union::spawn;
-let pool = spawn(2);
-pool.for_each_thread(|thread_index| {
+use fork_union as fu;
+let pool = fu::spawn(2);
+pool.broadcast(|thread_index| {
     println!("Hello from thread # {}", thread_index + 1);
 });
-pool.for_each_static(1000, |task_index| {
-    println!("Running task {} of 3", task_index + 1);
-});
-pool.for_each_slice(1000, |first_index, count| {
-    println!("Running slice [{}, {})", first_index, first_index + count);
-});
-pool.for_each_dynamic(1000, |task_index| {
-    println!("Running dynamic task {} of 1000", task_index + 1);
-});
+```
 
+Higher-level APIs distribute tasks across the threads in the pool:
+
+```rs
+fu::for_n(pool, 100, |prong| {
+    println!("Running task {} on thread # {}",
+        prong.task_index + 1, prong.thread_index + 1);
+});
+fu::for_slices(pool, 100, |prong, count| {
+    println!("Running slice [{}, {}) on thread # {}",
+        prong.task_index, prong.task_index + count, prong.thread_index + 1);
+});
+fu::for_n_dynamic(pool, 100, |prong| {
+    println!("Running task {} on thread # {}",
+        prong.task_index + 1, prong.thread_index + 1);
+});
 ```
 
 A safer `try_spawn_in` interface is recommended, using the Allocator API.
@@ -59,17 +62,17 @@ A more realistic example may look like this:
 use std::thread;
 use std::error::Error;
 use std::alloc::Global;
-use fork_union::ForkUnion;
+use fork_union as fu;
 
 fn heavy_math(_: usize) {}
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let pool = ForkUnion::try_spawn(4)?;
-    let pool = ForkUnion::try_spawn_in(4, Global)?;
-    let pool = ForkUnion::try_named_spawn("heavy-math", 4)?;
-    let pool = ForkUnion::try_named_spawn_in("heavy-math", 4, Global)?;
-    pool.for_each_dynamic(400, |i| {
-        heavy_math(i);
+    let pool = fu::ThreadPool::try_spawn(4)?;
+    let pool = fu::ThreadPool::try_spawn_in(4, Global)?;
+    let pool = fu::ThreadPool::try_named_spawn("heavy-math", 4)?;
+    let pool = fu::ThreadPool::try_named_spawn_in("heavy-math", 4, Global)?;
+    fu::for_n_dynamic(pool, 400, |prong| {
+        heavy_math(prong.1);
     });
     Ok(())
 }
@@ -99,21 +102,21 @@ target_link_libraries(your_target PRIVATE fork_union::fork_union)
 Then, include the header in your C++ code:
 
 ```cpp
-#include <fork_union.hpp>   // `fork_union_t`
+#include <fork_union.hpp>   // `thread_pool_t`
 #include <cstdio>           // `stderr`
 #include <cstdlib>          // `EXIT_SUCCESS`
 
-namespace fun = ashvardanian::fork_union;
+namespace fu = ashvardanian::fork_union;
 
 int main() {
-    fun::fork_union_t pool;
+    fu::thread_pool_t pool;
     if (!pool.try_spawn(std::thread::hardware_concurrency())) {
         std::fprintf(stderr, "Failed to fork the threads\n");
         return EXIT_FAILURE;
     }
 
     // Dispatch a callback to each thread in the pool
-    pool.for_each_thread([&](std::size_t thread_index) noexcept {
+    pool.broadcast([&](std::size_t thread_index) noexcept {
         std::printf("Hello from thread # %zu (of %zu)\n", thread_index + 1, pool.count_threads());
     });
 
@@ -123,20 +126,20 @@ int main() {
     //      #pragma omp parallel for schedule(static)
     //      for (int i = 0; i < 1000; ++i) { ... }
     //
-    // You can also think about it as a shortcut for the `for_each_slice` + `for`.
-    pool.for_each_static(1000, [](std::size_t task_index) noexcept {
+    // You can also think about it as a shortcut for the `for_slices` + `for`.
+    fu::for_n(pool, 1000, [](std::size_t task_index) noexcept {
         std::printf("Running task %zu of 3\n", task_index + 1);
     });
-    pool.for_each_slice(1000, [](std::size_t first_index, std::size_t count) noexcept {
+    fu::for_slices(pool, 1000, [](std::size_t first_index, std::size_t count) noexcept {
         std::printf("Running slice [%zu, %zu)\n", first_index, first_index + count);
     });
 
-    // Like `for_each_static`, but each thread greedily steals tasks, without waiting for  
+    // Like `for_n`, but each thread greedily steals tasks, without waiting for  
     // the others or expecting individual tasks to have same runtimes. Analogous to:
     //
     //      #pragma omp parallel for schedule(dynamic, 1)
     //      for (int i = 0; i < 3; ++i) { ... }
-    pool.for_each_dynamic(3, [](std::size_t task_index) noexcept {
+    fu::for_n_dynamic(pool, 3, [](std::size_t task_index) noexcept {
         std::printf("Running dynamic task %zu of 1000\n", task_index + 1);
     });
     return EXIT_SUCCESS;
@@ -148,19 +151,10 @@ That's it.
 ## Why Not Use $𝑋$
 
 There are many other thread-pool implementations, that are more feature-rich, but have different limitations and design goals.
-Both in C++:
 
-- [`taskflow/taskflow`](https://github.com/taskflow/taskflow) ![https://github.com/taskflow/taskflow](https://img.shields.io/github/stars/taskflow/taskflow)
-- [`progschj/ThreadPool`](https://github.com/progschj/ThreadPool) ![https://github.com/progschj/ThreadPool](https://img.shields.io/github/stars/progschj/ThreadPool)
-- [`bshoshany/thread-pool`](https://github.com/bshoshany/thread-pool) ![https://github.com/bshoshany/thread-pool](https://img.shields.io/github/stars/bshoshany/thread-pool)
-- [`vit-vit/CTPL`](https://github.com/vit-vit/CTPL) ![https://github.com/vit-vit/CTPL](https://img.shields.io/github/stars/vit-vit/CTPL)
-- [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool) ![https://github.com/mtrebi/thread-pool](https://img.shields.io/github/stars/mtrebi/thread-pool)
-
-... and in Rust:
-
-- [`tokio-rs/tokio`](https://github.com/tokio-rs/tokio) ![https://github.com/tokio-rs/tokio](https://img.shields.io/github/stars/tokio-rs/tokio)
-- [`rayon-rs/rayon`](https://github.com/rayon-rs/rayon) ![https://github.com/rayon-rs/rayon](https://img.shields.io/github/stars/rayon-rs/rayon)
-- [`smol-rs/smol`](https://github.com/smol-rs/smol) ![https://github.com/smol-rs/smol](https://img.shields.io/github/stars/smol-rs/smol)
+- Modern C++: [`taskflow/taskflow`](https://github.com/taskflow/taskflow), [`progschj/ThreadPool`](https://github.com/progschj/ThreadPool), [`bshoshany/thread-pool`](https://github.com/bshoshany/thread-pool)
+- Traditional C++: [`vit-vit/CTPL`](https://github.com/vit-vit/CTPL), [`mtrebi/thread-pool`](https://github.com/mtrebi/thread-pool)
+- Rust: [`tokio-rs/tokio`](https://github.com/tokio-rs/tokio), [`rayon-rs/rayon`](https://github.com/rayon-rs/rayon), [`smol-rs/smol`](https://github.com/smol-rs/smol)
 
 Those are not designed for the same OpenMP-like use-cases as __`fork_union`__.
 Instead, they primarily focus on task queueing, which requires a lot more work.
@@ -208,31 +202,68 @@ That's why for the "dynamic" mode, we resort to using an additional atomic varia
 ### Alignment
 
 Assuming a thread-pool is a heavy object anyway, nobody will care if it's a bit larger than expected.
-That allows us to over-align the internal counters to `std::max_align_t` to avoid false sharing.
+That allows us to over-align the internal counters to `std::hardware_destructive_interference_size` to avoid false sharing.
 In that case, even on x86, where the entire cache will be exclusively owned by a single thread, in eager mode, we end up effectively "pipelining" the execution, where one thread may be incrementing the "in-flight" counter, while the other is decrementing the "remaining" counter, and others are executing the loop body in-between.
 
 ## Performance
 
-The performance goal of Fork Union is to be comparable to OpenMP when running on a single NUMA node.
-In [Parallel Reductions](https://github.com/ashvardanian/ParallelReductionsBenchmark), on tiny inputs, it has the following performance:
+One of the most common parallel workloads is the N-body simulation ¹.
+An implementation is available in both C++ and Rust in `scripts/nbody.cpp` and `scripts/nbody.rs` respectively.
+Both are extremely light-weight and involve little logic outside of number-crunching, so both can be easily profiled with `time` and introspected with `perf` Linux tools. 
 
-```bash
-$ PARALLEL_REDUCTIONS_LENGTH=1536 build_release/reduce_bench
-----------------------------------------------------------------------------
-Benchmark                 Time             CPU   Iterations UserCounters...
-----------------------------------------------------------------------------
-std::threads         2047275 ns      2008267 ns        13751 bytes/s=3.00106M/s
-tf::taskflow          109782 ns       106764 ns       254660 bytes/s=76.2837M/s
-av::fork_union         13136 ns        13136 ns      2117597 bytes/s=467.714M/s
-openmp                 10494 ns        10256 ns      2848849 bytes/s=585.492M/s
-```
+---
 
-## Testing
+C++ benchmarking results for $N=128$ bodies and $I=1e6$ iterations:
+
+| Machine        | OpenMP (D) | OpenMP (S) | Fork Union (D) | Fork Union (S) |
+| :------------- | ---------: | ---------: | -------------: | -------------: |
+| 16x Intel SPR  |      20.3s |      16.0s |          18.1s |          10.3s |
+| 12x Apple M2   |          ? |   1m:16.7s |     1m:30.3s ² |     1m:40.7s ² |
+| 96x Graviton 4 |      32.2s |      20.8s |          39.8s |          26.0s |
+
+Rust benchmarking results for $N=128$ bodies and $I=1e6$ iterations:
+
+| Machine        | Rayon (D) | Rayon (S) | Fork Union (D) | Fork Union (S) |
+| :------------- | --------: | --------: | -------------: | -------------: |
+| 16x Intel SPR  |     51.4s |     38.1s |          15.9s |           9.8s |
+| 12x Apple M2   |  3m:23.5s |   2m:0.6s |        4m:8.4s |       1m:20.8s |
+| 96x Graviton 4 |  2m:13.9s |  1m:35.6s |          18.9s |          10.1s |
+
+> ¹ Another common workload is "Parallel Reductions" covered in a separate [repository](https://github.com/ashvardanian/ParallelReductionsBenchmark).
+> ² When a combination of performance and efficiency cores is used, dynamic stealing may be more efficient than static slicing.
+
+## Safety & Logic
+
+There are only 3 core atomic variables in this thread-pool, and some of them are practically optional.
+Let's call every invocation of a `for_*` API - a "fork", and every exit from it a "join".
+
+| Variable          | Users Perspective            | Internal Usage                        |
+| :---------------- | :--------------------------- | :------------------------------------ |
+| `stop`            | Stop the entire thread-pool  | Tells workers when to exit the loop   |
+| `fork_generation` | "Forks" called since init    | Tells workers to wake up on new forks |
+| `threads_to_sync` | Threads not joined this fork | Tells main thread when workers finish |
+
+__Why don't we need atomics for "total_threads"?__
+The only way to change the number of threads is to `stop_and_reset` the entire thread-pool and then `try_spawn` it again.
+Either of those operations can only be called from one thread at a time and never coincides with any running tasks.
+That's ensured by the `stop`.
+
+__Why don't we need atomics for a "job pointer"?__
+A new task can only be submitted from one thread, that updates the number of parts for each new fork.
+During that update, the workers are asleep, spinning on old values of `fork_generation` and `stop`.
+They only wake up and access the new value once `fork_generation` increments, ensuring safety.
+
+__How do we deal with overflows and `SIZE_MAX`-sized tasks?__
+The library entirely avoids saturating multiplication and only uses one saturating addition in "release" builds.
+To test the consistency of arithmetic, the C++ template class can be instantiated with a custom `index_t`, such as `std::uint8_t` or `std::uint16_t`.
+In the former case, no more than 255 threads can operate and no more than 255 tasks can be addressed, allowing us to easily test every weird corner case of [0:255] threads competing for [0:255] tasks.
+
+## Testing and Benchmarking
 
 To run the C++ tests, use CMake:
 
 ```bash
-cmake -B build_release -D CMAKE_BUILD_TYPE=Release
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=clang++-15
 cmake --build build_release --config Release
 build_release/scripts/fork_union_test_cpp20
 ```
@@ -240,7 +271,15 @@ build_release/scripts/fork_union_test_cpp20
 For C++ debug builds, consider using the VS Code debugger presets or the following commands:
 
 ```bash
-cmake -B build_debug -D CMAKE_BUILD_TYPE=Debug
+cmake --build build_debug --config Debug
+build_debug/scripts/fork_union_test_cpp20
+```
+
+To build with an alternative compiler, like LLVM Clang, use the following command:
+
+```bash
+sudo apt-get install libomp-15-dev clang++-15 # OpenMP version must match Clang
+cmake -B build_debug -D CMAKE_BUILD_TYPE=Debug -D CMAKE_CXX_COMPILER=clang++-15
 cmake --build build_debug --config Debug
 build_debug/scripts/fork_union_test_cpp20
 ```
