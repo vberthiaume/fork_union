@@ -1,3 +1,37 @@
+/**
+ *  @brief Demo app: N-Body simulation with Fork Union and OpenMP.
+ *  @author Ash Vardanian
+ *  @file nbody.cpp
+ *
+ *  To control the script, several environment variables are used:
+ *
+ *  - `NBODY_COUNT` - number of bodies in the simulation (default: number of threads).
+ *  - `NBODY_ITERATIONS` - number of iterations to run the simulation (default: 1000).
+ *  - `NBODY_BACKEND` - backend to use for the simulation (default: `fork_union_static`).
+ *  - `NBODY_THREADS` - number of threads to use for the simulation (default: number of hardware threads).
+ *
+ *  The backends include: `fork_union_static`, `fork_union_dynamic`, `openmp_static`, and `openmp_dynamic`.
+ *  To compile and run:
+ *
+ *  @code{.sh}
+ *  cmake -B build_release -D CMAKE_BUILD_TYPE=Release
+ *  cmake --build build_release --config Release
+ *  NBODY_COUNT=128 NBODY_THREADS=$(nproc) build_release/scripts/fork_union_nbody
+ *  @endcode
+ *
+ *  The default profiling scheme is to 1M iterations for 128 particles on each backend:
+ *
+ *  @code{.sh}
+ *  time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
+ *      NBODY_BACKEND=openmp_static build_release/scripts/fork_union_nbody
+ *  time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
+ *      NBODY_BACKEND=openmp_dynamic build_release/scripts/fork_union_nbody
+ *  time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
+ *      NBODY_BACKEND=fork_union_static build_release/scripts/fork_union_nbody
+ *  time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
+ *      NBODY_BACKEND=fork_union_dynamic build_release/scripts/fork_union_nbody
+ *  @endcode
+ */
 #include <vector> // `std::vector`
 #include <random> // `std::random_device`, `std::uniform_real_distribution`
 #include <thread> // `std::thread::hardware_concurrency`

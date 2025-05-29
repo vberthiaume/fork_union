@@ -30,21 +30,28 @@ Both are available in C++ and Rust.
 A minimal example may look like this:
 
 ```rs
-use fork_union::spawn;
-let pool = spawn(2);
+use fork_union as fu;
+let pool = fu::spawn(2);
 pool.broadcast(|thread_index| {
     println!("Hello from thread # {}", thread_index + 1);
 });
-for_n(pool, 1000, |task_index| {
-    println!("Running task {} of 3", task_index + 1);
-});
-for_slices(pool, 1000, |first_index, count| {
-    println!("Running slice [{}, {})", first_index, first_index + count);
-});
-for_n_dynamic(pool, 1000, |task_index| {
-    println!("Running dynamic task {} of 1000", task_index + 1);
-});
+```
 
+Higher-level APIs distribute tasks across the threads in the pool:
+
+```rs
+fu::for_n(pool, 100, |prong| {
+    println!("Running task {} on thread # {}",
+        prong.task_index + 1, prong.thread_index + 1);
+});
+fu::for_slices(pool, 100, |prong, count| {
+    println!("Running slice [{}, {}) on thread # {}",
+        prong.task_index, prong.task_index + count, prong.thread_index + 1);
+});
+fu::for_n_dynamic(pool, 100, |prong| {
+    println!("Running task {} on thread # {}",
+        prong.task_index + 1, prong.thread_index + 1);
+});
 ```
 
 A safer `try_spawn_in` interface is recommended, using the Allocator API.
@@ -55,17 +62,17 @@ A more realistic example may look like this:
 use std::thread;
 use std::error::Error;
 use std::alloc::Global;
-use fork_union::ForkUnion;
+use fork_union as fu;
 
 fn heavy_math(_: usize) {}
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let pool = ForkUnion::try_spawn(4)?;
-    let pool = ForkUnion::try_spawn_in(4, Global)?;
-    let pool = ForkUnion::try_named_spawn("heavy-math", 4)?;
-    let pool = ForkUnion::try_named_spawn_in("heavy-math", 4, Global)?;
-    for_n_dynamic(pool, 400, |i| {
-        heavy_math(i);
+    let pool = fu::ThreadPool::try_spawn(4)?;
+    let pool = fu::ThreadPool::try_spawn_in(4, Global)?;
+    let pool = fu::ThreadPool::try_named_spawn("heavy-math", 4)?;
+    let pool = fu::ThreadPool::try_named_spawn_in("heavy-math", 4, Global)?;
+    fu::for_n_dynamic(pool, 400, |prong| {
+        heavy_math(prong.1);
     });
     Ok(())
 }
@@ -95,14 +102,14 @@ target_link_libraries(your_target PRIVATE fork_union::fork_union)
 Then, include the header in your C++ code:
 
 ```cpp
-#include <fork_union.hpp>   // `fork_union_t`
+#include <fork_union.hpp>   // `thread_pool_t`
 #include <cstdio>           // `stderr`
 #include <cstdlib>          // `EXIT_SUCCESS`
 
 namespace fu = ashvardanian::fork_union;
 
 int main() {
-    fu::fork_union_t pool;
+    fu::thread_pool_t pool;
     if (!pool.try_spawn(std::thread::hardware_concurrency())) {
         std::fprintf(stderr, "Failed to fork the threads\n");
         return EXIT_FAILURE;
@@ -216,17 +223,6 @@ For $N=128$ bodies, $I=1e6$ iterations, using the maximum number of threads avai
 | 96x Graviton 4 |      32.2s |      20.8s |           41.2 |          26.0s |
 
 > ¹ When a combination of performance and efficiency cores is used, dynamic stealing may be more efficient than static slicing.
-
-To reproduce on your Linux machine, run the following commands:
-
-```bash
-cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=clang++-15
-cmake --build build_release --config Release
-time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 NBODY_BACKEND=openmp_static build_release/scripts/fork_union_nbody
-time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 NBODY_BACKEND=openmp_dynamic build_release/scripts/fork_union_nbody
-time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 NBODY_BACKEND=fork_union_static build_release/scripts/fork_union_nbody
-time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 NBODY_BACKEND=fork_union_dynamic build_release/scripts/fork_union_nbody
-```
 
 ### Rust Benchmarks
 

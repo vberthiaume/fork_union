@@ -1,14 +1,14 @@
 /**
+ *  @brief  OpenMP-style cross-platform fine-grained parallelism library.
  *  @file   fork_union.hpp
- *  @brief  Minimalistic C++ thread-pool designed for SIMT-style 'Fork-Join' parallelism.
  *  @author Ash Vardanian
  *  @date   May 2, 2025
  *
  *  Fork Union provides a minimalistic cross-platform thread-pool implementation and Parallel Algorithms,
  *  avoiding dynamic memory allocations, exceptions, system calls, and heavy Compare-And-Swap instructions.
  *  The library leverages the "weak memory model" to allow Arm and IBM Power CPUs to aggressively optimize
- *  optimize execution at runtime. It's compatible with C++11 and later. It also aggressively tests against
- *  overflows on smaller index types, and is safe to use even with the maximal `std::size_t` values.
+ *  execution at runtime. It also aggressively tests against overflows on smaller index types, and is safe
+ *  to use even with the maximal `std::size_t` values. It's compatible with C++11 and later.
  *
  *  @code{.cpp}
  *  #include <cstdio> // `std::printf`

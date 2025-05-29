@@ -10,6 +10,7 @@
                 "OpenMP",
                 "println",
                 "repr",
+                "rsqrt",
                 "SIMT",
                 "STREQUAL",
                 "syscall",
@@ -53,6 +54,7 @@
                 "exception": "cpp",
                 "format": "cpp",
                 "forward_list": "cpp",
+                "functional": "cpp",
                 "initializer_list": "cpp",
                 "iomanip": "cpp",
                 "ios": "cpp",
@@ -61,6 +63,7 @@
                 "iterator": "cpp",
                 "limits": "cpp",
                 "locale": "cpp",
+                "memory": "cpp",
                 "memory_resource": "cpp",
                 "mutex": "cpp",
                 "new": "cpp",
@@ -87,8 +90,6 @@
                 "unordered_map": "cpp",
                 "utility": "cpp",
                 "variant": "cpp",
-                "vector": "cpp",
-                "functional": "cpp",
-                "memory": "cpp"
+                "vector": "cpp"
         }
 }

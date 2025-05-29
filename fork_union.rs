@@ -1,3 +1,11 @@
+//! OpenMP-style cross-platform fine-grained parallelism library.
+//!
+//! Fork Union provides a minimalistic cross-platform thread-pool implementation and Parallel Algorithms,
+//! avoiding dynamic memory allocations, exceptions, system calls, and heavy Compare-And-Swap instructions.
+//! The library leverages the "weak memory model" to allow Arm and IBM Power CPUs to aggressively optimize
+//! execution at runtime. It also aggressively tests against overflows on smaller index types, and is safe
+//! to use even with the maximal `usize` values. It's compatible with the Nightly toolchain and requires
+//! the `allocator_api` feature to be enabled.
 #![feature(allocator_api)]
 use core::fmt::Write as _;
 use std::alloc::{AllocError, Allocator, Global};
