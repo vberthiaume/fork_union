@@ -8,6 +8,7 @@
 //! the `allocator_api` feature to be enabled.
 #![feature(allocator_api)]
 use core::fmt::Write as _;
+use core::marker::PhantomData;
 use std::alloc::{AllocError, Allocator, Global};
 use std::collections::TryReserveError;
 use std::fmt;
@@ -240,7 +241,7 @@ impl<A: Allocator + Clone> ThreadPool<A> {
     }
 
     /// Returns the number of threads in the pool.
-    pub fn thread_count(&self) -> usize {
+    pub fn threads(&self) -> usize {
         self.inner.total_threads
     }
 
@@ -263,7 +264,7 @@ impl<A: Allocator + Clone> ThreadPool<A> {
     where
         F: Fn(usize) + Sync,
     {
-        let threads = self.thread_count();
+        let threads = self.threads();
         assert!(threads != 0, "Thread pool not initialized");
         if threads == 1 {
             function(0);
@@ -362,11 +363,11 @@ where
     A: Allocator + Clone,
     F: Fn(Prong, usize) + Sync,
 {
-    assert!(pool.thread_count() != 0, "Thread pool not initialized");
+    assert!(pool.threads() != 0, "Thread pool not initialized");
     if n == 0 {
         return;
     }
-    let threads = pool.thread_count();
+    let threads = pool.threads();
     if threads == 1 || n == 1 {
         function(
             Prong {
@@ -434,7 +435,7 @@ where
         });
         return;
     }
-    let threads = pool.thread_count();
+    let threads = pool.threads();
     if threads == 1 {
         for i in 0..prongs_count {
             function(Prong {
@@ -470,6 +471,137 @@ where
     });
 }
 
+/// Raw mutable pointer that can cross threads.
+///
+/// # Safety
+/// You must uphold the usual aliasing rules manually.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct SyncMutPtr<T>(*mut T, PhantomData<*mut T>);
+
+/// Raw const pointer that can cross threads.
+///
+/// # Safety
+/// You must ensure the closure environment is thread-safe.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct SyncConstPtr<F>(*const F, PhantomData<*const F>);
+
+unsafe impl<T> Send for SyncMutPtr<T> {}
+unsafe impl<T> Sync for SyncMutPtr<T> {}
+unsafe impl<F> Send for SyncConstPtr<F> {}
+unsafe impl<F> Sync for SyncConstPtr<F> {}
+
+impl<T> SyncMutPtr<T> {
+    #[inline]
+    pub fn new(ptr: *mut T) -> Self {
+        Self(ptr, PhantomData)
+    }
+
+    /// # Safety
+    /// Caller must ensure `index` is in-bounds **and** that aliasing rules are respected.
+    #[inline(always)]
+    pub unsafe fn get_mut(&self, index: usize) -> &mut T {
+        &mut *self.0.add(index)
+    }
+}
+
+impl<F> SyncConstPtr<F> {
+    #[inline]
+    pub fn new(ptr: *const F) -> Self {
+        Self(ptr, PhantomData)
+    }
+
+    /// # Safety
+    /// Same safety requirements as the original closure plus `item`’s aliasing.
+    #[inline]
+    pub unsafe fn call<T>(&self, item: &mut T, prong: Prong)
+    where
+        F: Fn(&mut T, Prong),
+    {
+        (&*self.0)(item, prong)
+    }
+
+    /// # Safety
+    /// Caller must ensure `index` is in-bounds **and** that aliasing rules are respected.
+    #[inline(always)]
+    pub unsafe fn get(&self, index: usize) -> &F {
+        &*self.0.add(index)
+    }
+}
+
+/// Visit every element **exactly once**, passing both the `Prong`
+/// (so you know `thread_index` and `task_index`) **and** a mutable
+/// reference to that element.
+///
+/// The work distribution is the same _static_ slicing that `for_n`
+/// already uses, so the overhead is one extra pointer and a bounds
+/// calculation — nothing more.
+///
+/// ```no_run
+/// use fork_union as fu;
+/// let pool = fu::spawn(1);
+/// let mut data = vec![0u64; 1_000_000];
+/// fu::for_each_prong_mut(&pool, &mut data, |x, prong| {
+///     *x = prong.task_index as u64 * 2;
+/// });
+/// ```
+///
+/// There is a lot of ugly `unsafe` boilerplate needed to mutate a
+/// set of elements in parallel, so this API serves as a shortcut.
+///
+/// Similar to Rayon's `par_chunks_mut`.
+pub fn for_each_prong_mut<A, T, F>(pool: &ThreadPool<A>, data: &mut [T], function: F)
+where
+    A: Allocator + Clone,
+    T: Send,
+    F: Fn(&mut T, Prong) + Sync,
+{
+    let base_ptr = SyncMutPtr::new(data.as_mut_ptr());
+    let fun_ptr = SyncConstPtr::new(&function as *const F);
+    let n = data.len();
+    for_n(pool, n, move |prong| unsafe {
+        let item = base_ptr.get_mut(prong.task_index);
+        fun_ptr.call(item, prong);
+    });
+}
+
+/// Visit every element **exactly once**, passing both the `Prong`
+/// (so you know `thread_index` and `task_index`) **and** a mutable
+/// reference to that element.
+///
+/// The work distribution is _dynamic_ stealing, so the threads
+/// will compete for the elements, and the order of execution is
+/// not guaranteed to be sequential.
+///
+/// ```no_run
+/// use fork_union as fu;
+/// let pool = fu::spawn(1);
+/// let mut strings = vec![String::new(); 1_000];
+/// fu::for_each_prong_mut_dynamic(&pool, &mut strings, |prong, s| {
+///     s.push_str(&format!("hello from thread {}", prong.thread_index));
+/// });
+/// ```
+///
+/// There is a lot of ugly `unsafe` boilerplate needed to mutate a
+/// set of elements in parallel, so this API serves as a shortcut.
+///
+/// Similar to Rayon's `par_iter_mut`.
+pub fn for_each_prong_mut_dynamic<A, T, F>(pool: &ThreadPool<A>, data: &mut [T], function: F)
+where
+    A: Allocator + Clone,
+    T: Send,
+    F: Fn(&mut T, Prong) + Sync,
+{
+    let base_ptr = SyncMutPtr::new(data.as_mut_ptr());
+    let fun_ptr = SyncConstPtr::new(&function as *const F);
+    let n = data.len();
+    for_n_dynamic(pool, n, move |prong| unsafe {
+        let item = base_ptr.get_mut(prong.task_index);
+        fun_ptr.call(item, prong);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,13 +621,13 @@ mod tests {
     #[test]
     fn spawn_with_global() {
         let pool = spawn(2);
-        assert_eq!(pool.thread_count(), 2);
+        assert_eq!(pool.threads(), 2);
     }
 
     #[test]
     fn spawn_with_allocator() {
         let pool = ThreadPool::try_spawn_in(2, Global).expect("spawn");
-        assert_eq!(pool.thread_count(), 2);
+        assert_eq!(pool.threads(), 2);
     }
 
     #[test]
