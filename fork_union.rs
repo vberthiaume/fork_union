@@ -578,7 +578,7 @@ where
 /// use fork_union as fu;
 /// let pool = fu::spawn(1);
 /// let mut strings = vec![String::new(); 1_000];
-/// fu::for_each_prong_mut_dynamic(&pool, &mut strings, |prong, s| {
+/// fu::for_each_prong_mut_dynamic(&pool, &mut strings, |s, prong| {
 ///     s.push_str(&format!("hello from thread {}", prong.thread_index));
 /// });
 /// ```
