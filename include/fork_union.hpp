@@ -428,6 +428,7 @@ void for_slices(                                                 //
                   "The callback must be invocable with a `prong_t` or a `index_t` argument and an unsigned counter");
 #endif
 
+    assert(n <= static_cast<std::size_t>(std::numeric_limits<index_t>::max()) && "Will overflow");
     index_t const prongs_count = static_cast<index_t>(n);
     if (prongs_count == 0) return;
 
@@ -523,6 +524,7 @@ void for_n_dynamic(                                              //
 #endif
 
     // No need to slice the work if there is just one task
+    assert(n <= static_cast<std::size_t>(std::numeric_limits<index_t>::max()) && "Will overflow");
     index_t const prongs_count = static_cast<index_t>(n);
     if (prongs_count == 0) return;
     if (prongs_count == 1) return function(prong_t {0, 0});
