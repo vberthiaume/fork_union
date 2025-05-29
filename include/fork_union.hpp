@@ -351,8 +351,12 @@ class thread_pool {
                    (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
                 std::this_thread::yield();
 
-            if (wants_to_stop) [[unlikely]]
+#if _FU_DETECT_CPP_20
+            if (wants_to_stop) [[unlikely]] // Attributes require C++20
                 return;
+#else
+            if (wants_to_stop) return;
+#endif
 
             fork_trampoline_pointer_(fork_lambda_pointer_, thread_index);
             last_fork_generation = new_fork_generation;
