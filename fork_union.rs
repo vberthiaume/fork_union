@@ -8,16 +8,38 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 
-use crossbeam_utils::CachePadded;
+/// Pads the wrapped value to 128 bytes to avoid false sharing.
+#[repr(align(128))]
+struct Padded<T>(T);
+
+impl<T> Padded<T> {
+    #[inline]
+    fn new(value: T) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> core::ops::Deref for Padded<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> core::ops::DerefMut for Padded<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[derive(Debug)]
-pub enum ForkUnionError {
+pub enum Error {
     Alloc(AllocError),
     Reserve(TryReserveError),
     Spawn(IoError),
 }
 
-impl fmt::Display for ForkUnionError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Alloc(_) => write!(f, "allocation failure"),
@@ -27,7 +49,7 @@ impl fmt::Display for ForkUnionError {
     }
 }
 
-impl std::error::Error for ForkUnionError {
+impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             // `AllocError` doesn't implement `Error`, so no source here.
@@ -39,35 +61,26 @@ impl std::error::Error for ForkUnionError {
     }
 }
 
-/// Describes a portion of work executed on a specific thread.
-#[derive(Copy, Clone)]
-pub struct Task {
-    pub thread_index: usize,
-    pub task_index: usize,
-}
-
-type Trampoline = unsafe fn(*const (), Task);
+type Trampoline = unsafe fn(*const (), usize);
 
 /// Dummy trampoline function as opposed to the real `worker_loop`.
-unsafe fn dummy_trampoline(_ctx: *const (), _task: Task) {
+unsafe fn dummy_trampoline(_ctx: *const (), _index: usize) {
     unreachable!("dummy_trampoline should not be called")
 }
 
 /// The shared state of the thread pool, used by all threads.
 /// It intentionally pads all of independently mutable regions to avoid false sharing.
 /// The `task_trampoline` function receives the `task_context` state pointers and
-/// some ethereal `Task` index similar to C-style thread pools.
-#[repr(align(64))]
+/// some ethereal thread index similar to C-style thread pools.
+#[repr(align(128))]
 struct Inner {
     pub total_threads: usize,
-    pub task_context: *const (),
-    pub task_trampoline: Trampoline,
-    pub task_parts_count: usize,
+    pub stop: Padded<AtomicBool>,
 
-    pub stop: CachePadded<AtomicBool>,
-    pub task_parts_remaining: CachePadded<AtomicUsize>,
-    pub task_parts_passed: CachePadded<AtomicUsize>,
-    pub task_generation: CachePadded<AtomicUsize>,
+    pub fork_context: *const (),
+    pub fork_trampoline: Trampoline,
+    pub threads_to_sync: Padded<AtomicUsize>,
+    pub fork_generation: Padded<AtomicUsize>,
 }
 
 unsafe impl Sync for Inner {}
@@ -76,40 +89,36 @@ unsafe impl Send for Inner {}
 impl Inner {
     pub fn new(threads: usize) -> Self {
         Self {
-            stop: CachePadded::new(AtomicBool::new(false)),
             total_threads: threads,
-            task_context: ptr::null(),
-            task_trampoline: dummy_trampoline,
-            task_parts_count: 0,
-
-            task_parts_remaining: CachePadded::new(AtomicUsize::new(0)),
-            task_parts_passed: CachePadded::new(AtomicUsize::new(0)),
-            task_generation: CachePadded::new(AtomicUsize::new(0)),
+            stop: Padded::new(AtomicBool::new(false)),
+            fork_context: ptr::null(),
+            fork_trampoline: dummy_trampoline,
+            threads_to_sync: Padded::new(AtomicUsize::new(0)),
+            fork_generation: Padded::new(AtomicUsize::new(0)),
         }
     }
 
-    fn reset_task(&self) {
+    fn reset_fork(&self) {
         unsafe {
-            let mutable_self = self as *const Self as *mut Self;
-            (*mutable_self).task_parts_count = 0;
-            (*mutable_self).task_context = ptr::null();
-            (*mutable_self).task_trampoline = dummy_trampoline;
+            let this = self as *const Self as *mut Self;
+            (*this).fork_context = ptr::null();
+            (*this).fork_trampoline = dummy_trampoline;
         }
     }
 
     fn trampoline(&self) -> Trampoline {
-        self.task_trampoline
+        self.fork_trampoline
     }
 
     fn context(&self) -> *const () {
-        self.task_context
+        self.fork_context
     }
 }
 
 /// Minimalistic, fixed‑size thread‑pool for blocking scoped parallelism.
 ///
 /// - You create the pool once with **N** logical threads (`try_spawn[_in]`).
-/// - You submit a *single* blocking kernel (`for_each_*`) that might touch millions of tasks.
+/// - You submit a *single* blocking kernel (`broadcast`) on all running threads.
 /// - The pool is torn down (or reused for the next kernel) when the call returns.
 ///
 /// The current thread **participates** in the work, so for `N`‑way parallelism the
@@ -129,22 +138,19 @@ impl Inner {
 ///
 /// | Method             | Scheduling          | Suitable for        |
 /// |--------------------|---------------------|---------------------|
-/// | `for_each_thread`  | one call per worker | thread‑local state  |
-/// | `for_each_static`  | static slices       | evenly sized tasks  |
-/// | `for_each_dynamic` | work‑stealing       | unpredictable tasks |
+/// | `broadcast`        | one call per worker | thread‑local state  |
+/// | `for_n`            | static slices       | evenly sized tasks  |
+/// | `for_n_dynamic`    | work‑stealing       | unpredictable tasks |
 ///
 /// ### Example
 ///
-/// The simplest example of using the pool:
+/// The simplest example of using the pool to greet from all threads:
 ///
 /// ```no_run
-/// use fork_union::spawn;
-///
-/// fn heavy_math(_: usize) {}
-///
-/// let pool = spawn(4); // ! Unsafe shortcut, see below
-/// pool.for_each_static(400, |i| {
-///     heavy_math(i); // Will be called 400 times, 100 per thread.
+/// use fork_union as fu;
+/// let pool = fu::spawn(4); // ! Unsafe shortcut, see below
+/// pool.broadcast(|thread_index| {
+///     println!("Hello from thread {thread_index}!");
 /// });
 /// ```
 ///
@@ -155,33 +161,29 @@ impl Inner {
 /// use std::thread;
 /// use std::error::Error;
 /// use std::alloc::Global;
-/// use fork_union::ForkUnion;
+/// use fork_union as fu;
 ///
 /// fn heavy_math(_: usize) {}
 ///
 /// fn main() -> Result<(), Box<dyn Error>> {
-///     let pool = ForkUnion::try_spawn_in(4, Global)?;
-///     pool.for_each_dynamic(400, |i| {
-///         heavy_math(i); // More expensive to synchronize, but better for uneven workloads.
+///     let pool = fu::ThreadPool::try_spawn_in(4, Global)?;
+///     fu::for_n_dynamic(&pool, 400, |prong| {
+///         heavy_math(prong.task_index);
 ///     });
 ///     Ok(())
 /// }
 /// ```
 ///
-pub struct ForkUnion<A: Allocator + Clone = Global> {
+pub struct ThreadPool<A: Allocator + Clone = Global> {
     inner: Box<Inner, A>,
     workers: Vec<JoinHandle<()>, A>,
 }
 
-impl<A: Allocator + Clone> ForkUnion<A> {
+impl<A: Allocator + Clone> ThreadPool<A> {
     /// Creates the pool with the desired number of threads using a custom allocator.
-    pub fn try_named_spawn_in(
-        name: &str,
-        planned_threads: usize,
-        alloc: A,
-    ) -> Result<Self, ForkUnionError> {
+    pub fn try_named_spawn_in(name: &str, planned_threads: usize, alloc: A) -> Result<Self, Error> {
         if planned_threads == 0 {
-            return Err(ForkUnionError::Spawn(IoError::new(
+            return Err(Error::Spawn(IoError::new(
                 std::io::ErrorKind::InvalidInput,
                 "Thread count must be > 0",
             )));
@@ -194,19 +196,19 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         }
 
         // With the `inner` object allocated on the heap it we will be able to move the owning object around.
-        let inner = Box::try_new_in(Inner::new(planned_threads), alloc.clone())
-            .map_err(ForkUnionError::Alloc)?;
+        let inner =
+            Box::try_new_in(Inner::new(planned_threads), alloc.clone()).map_err(Error::Alloc)?;
         let inner_ptr: &'static Inner = unsafe { &*(inner.as_ref() as *const Inner) };
 
         let workers_cap = planned_threads.saturating_sub(1);
-        let mut workers = Vec::try_with_capacity_in(workers_cap, alloc.clone())
-            .map_err(ForkUnionError::Reserve)?;
+        let mut workers =
+            Vec::try_with_capacity_in(workers_cap, alloc.clone()).map_err(Error::Reserve)?;
         for i in 0..workers_cap {
             // We need to carefully fill the workers name
             let mut worker_name = String::new();
             worker_name
                 .try_reserve_exact(name.len() + 3)
-                .map_err(ForkUnionError::Reserve)?;
+                .map_err(Error::Reserve)?;
             worker_name.push_str(name);
             write!(&mut worker_name, "{:03}", i + 1)
                 .expect("writing into a reserved String never fails");
@@ -216,7 +218,7 @@ impl<A: Allocator + Clone> ForkUnion<A> {
                 let worker = thread::Builder::new()
                     .name(worker_name)
                     .spawn_unchecked(move || worker_loop(inner_ptr, i + 1))
-                    .map_err(ForkUnionError::Spawn)?;
+                    .map_err(Error::Spawn)?;
                 workers.push(worker);
             }
         }
@@ -225,8 +227,8 @@ impl<A: Allocator + Clone> ForkUnion<A> {
     }
 
     /// Creates the pool with the desired number of threads using a custom allocator.
-    pub fn try_spawn_in(planned_threads: usize, alloc: A) -> Result<Self, ForkUnionError> {
-        Self::try_named_spawn_in("ForkUnion", planned_threads, alloc)
+    pub fn try_spawn_in(planned_threads: usize, alloc: A) -> Result<Self, Error> {
+        Self::try_named_spawn_in("ThreadPool", planned_threads, alloc)
     }
 
     /// Returns the number of threads in the pool.
@@ -239,8 +241,8 @@ impl<A: Allocator + Clone> ForkUnion<A> {
         if self.inner.total_threads <= 1 {
             return;
         }
-        assert!(self.inner.task_parts_remaining.load(Ordering::SeqCst) == 0);
-        self.inner.reset_task();
+        assert!(self.inner.threads_to_sync.load(Ordering::SeqCst) == 0);
+        self.inner.reset_fork();
         self.inner.stop.store(true, Ordering::Release);
         for handle in self.workers.drain(..) {
             let _ = handle.join();
@@ -249,215 +251,215 @@ impl<A: Allocator + Clone> ForkUnion<A> {
     }
 
     /// Executes a function on each thread of the pool.
-    pub fn for_each_thread<F>(&self, function: F)
+    pub fn broadcast<F>(&self, function: F)
     where
         F: Fn(usize) + Sync,
     {
-        if self.inner.total_threads == 1 {
+        let threads = self.thread_count();
+        assert!(threads != 0, "Thread pool not initialized");
+        if threads == 1 {
             function(0);
             return;
         }
+
         let ctx = &function as *const F as *const ();
         unsafe {
             let inner_ptr = self.inner.as_ref() as *const Inner as *mut Inner;
-            (*inner_ptr).task_context = ctx;
-            (*inner_ptr).task_trampoline = call_thread::<F>;
-            (*inner_ptr).task_parts_count = self.inner.total_threads;
+            (*inner_ptr).fork_context = ctx;
+            (*inner_ptr).fork_trampoline = call_lambda::<F>;
         }
         self.inner
-            .task_parts_remaining
-            .store(self.inner.total_threads - 1, Ordering::Relaxed);
-        self.inner
-            .task_generation
-            .fetch_add(1, Ordering::Release);
+            .threads_to_sync
+            .store(threads - 1, Ordering::Relaxed);
+        self.inner.fork_generation.fetch_add(1, Ordering::Release);
+
         function(0);
-        while self
-            .inner
-            .task_parts_remaining
-            .load(Ordering::Acquire)
-            != 0
-        {
+
+        while self.inner.threads_to_sync.load(Ordering::Acquire) != 0 {
             thread::yield_now();
         }
-        self.inner.reset_task();
-    }
-
-    /// Executes evenly sized tasks on each thread.
-    pub fn for_each_slice<F>(&self, n: usize, function: F)
-    where
-        F: Fn(usize, usize) + Sync,
-    {
-        assert!(self.inner.total_threads != 0, "Thread pool not initialized");
-        if self.inner.total_threads == 1 || n == 1 {
-            function(0, n);
-            return;
-        }
-        if n == 0 {
-            return;
-        }
-        let per_thread = n.div_ceil(self.inner.total_threads);
-        self.for_each_thread(|thread_index| {
-            let begin = std::cmp::min(thread_index * per_thread, n);
-            let count = std::cmp::min(begin + per_thread, n) - begin;
-            function(begin, count);
-        });
-    }
-
-    /// Executes `n` balanced tasks in parallel.
-    pub fn for_each_static<F>(&self, n: usize, function: F)
-    where
-        F: Fn(usize) + Sync,
-    {
-        self.for_each_slice(n, |start, count| {
-            for i in 0..count {
-                function(start + i);
-            }
-        });
-    }
-
-    /// Executes `n` uneven tasks, greedily stealing work.
-    pub fn for_each_dynamic<F>(&self, n: usize, function: F)
-    where
-        F: Fn(usize) + Sync,
-    {
-        if self.inner.total_threads == 1 {
-            for i in 0..n {
-                function(i);
-            }
-            return;
-        }
-        if n == 0 {
-            return;
-        }
-        if n == 1 {
-            function(0);
-            return;
-        }
-        let ctx = &function as *const F as *const ();
-        unsafe {
-            let inner_ptr = self.inner.as_ref() as *const Inner as *mut Inner;
-            (*inner_ptr).task_context = ctx;
-            (*inner_ptr).task_trampoline = call_index::<F>;
-            (*inner_ptr).task_parts_count = n;
-        }
-        self.inner
-            .task_parts_passed
-            .store(0, Ordering::Relaxed);
-        self.inner
-            .task_parts_remaining
-            .store(n, Ordering::Relaxed);
-        self.inner
-            .task_generation
-            .fetch_add(1, Ordering::Release);
-        // SAFETY: `self.inner` lives as long as the pool
-        let inner_ref: &'static Inner = unsafe { &*(self.inner.as_ref() as *const Inner) };
-        dynamic_loop(inner_ref, 0);
-        while self
-            .inner
-            .task_parts_remaining
-            .load(Ordering::Acquire)
-            != 0
-        {
-            thread::yield_now();
-        }
-        self.inner.reset_task();
+        self.inner.reset_fork();
     }
 }
 
-impl<A: Allocator + Clone> Drop for ForkUnion<A> {
+impl<A: Allocator + Clone> Drop for ThreadPool<A> {
     fn drop(&mut self) {
         self.stop_and_reset();
     }
 }
 
-impl<A> ForkUnion<A>
+impl<A> ThreadPool<A>
 where
     A: Allocator + Clone + Default,
 {
-    pub fn try_spawn(planned_threads: usize) -> Result<Self, ForkUnionError> {
-        Self::try_named_spawn_in("ForkUnion", planned_threads, A::default())
+    pub fn try_spawn(planned_threads: usize) -> Result<Self, Error> {
+        Self::try_named_spawn_in("ThreadPool", planned_threads, A::default())
     }
 
-    pub fn try_named_spawn(name: &str, planned_threads: usize) -> Result<Self, ForkUnionError> {
+    pub fn try_named_spawn(name: &str, planned_threads: usize) -> Result<Self, Error> {
         Self::try_named_spawn_in(name, planned_threads, A::default())
     }
 }
 
-unsafe fn call_thread<F: Fn(usize)>(ctx: *const (), task: Task) {
+unsafe fn call_lambda<F: Fn(usize)>(ctx: *const (), index: usize) {
     let f = &*(ctx as *const F);
-    f(task.thread_index);
-}
-
-unsafe fn call_index<F: Fn(usize)>(ctx: *const (), task: Task) {
-    let f = &*(ctx as *const F);
-    f(task.task_index);
+    f(index);
 }
 
 fn worker_loop(inner: &'static Inner, thread_index: usize) {
     let mut last_generation = 0usize;
+    assert!(thread_index != 0);
     loop {
         let mut new_generation;
+        let mut wants_stop;
         while {
-            new_generation = inner.task_generation.load(Ordering::Acquire);
-            new_generation == last_generation && !inner.stop.load(Ordering::Acquire)
+            new_generation = inner.fork_generation.load(Ordering::Acquire);
+            wants_stop = inner.stop.load(Ordering::Acquire);
+            new_generation == last_generation && !wants_stop
         } {
             thread::yield_now();
         }
-        if inner.stop.load(Ordering::Acquire) {
+        if wants_stop {
             return;
         }
-        let is_static = inner.task_parts_count == inner.total_threads;
-        if is_static && inner.task_parts_count > 0 {
-            let trampoline = inner.trampoline();
-            let context = inner.context();
-            unsafe {
-                trampoline(
-                    context,
-                    Task {
-                        thread_index,
-                        task_index: thread_index,
-                    },
-                );
-            }
-            inner
-                .task_parts_remaining
-                .fetch_sub(1, Ordering::AcqRel);
-        } else {
-            dynamic_loop(inner, thread_index);
+
+        let trampoline = inner.trampoline();
+        let context = inner.context();
+        unsafe {
+            trampoline(context, thread_index);
         }
         last_generation = new_generation;
-    }
-}
 
-fn dynamic_loop(inner: &'static Inner, thread_index: usize) {
-    let trampoline = inner.trampoline();
-    let context = inner.context();
-    loop {
-        let idx = inner
-            .task_parts_passed
-            .fetch_add(1, Ordering::Relaxed);
-        if idx >= inner.task_parts_count {
-            break;
-        }
-        unsafe {
-            trampoline(
-                context,
-                Task {
-                    thread_index,
-                    task_index: idx,
-                },
-            );
-        }
-        inner
-            .task_parts_remaining
-            .fetch_sub(1, Ordering::AcqRel);
+        let before = inner.threads_to_sync.fetch_sub(1, Ordering::Release);
+        debug_assert!(before > 0);
     }
 }
 
 /// Spawns a pool with the default allocator.
-pub fn spawn(planned_threads: usize) -> ForkUnion<Global> {
-    ForkUnion::<Global>::try_spawn_in(planned_threads, Global)
-        .expect("Failed to spawn ForkUnion thread pool")
+pub fn spawn(planned_threads: usize) -> ThreadPool<Global> {
+    ThreadPool::<Global>::try_spawn_in(planned_threads, Global)
+        .expect("Failed to spawn ThreadPool thread pool")
+}
+
+/// Describes a portion of work executed on a specific thread.
+#[derive(Copy, Clone)]
+pub struct Prong {
+    pub thread_index: usize,
+    pub task_index: usize,
+}
+
+/// Distributes `n` similar duration calls between threads in slices.
+pub fn for_slices<A, F>(pool: &ThreadPool<A>, n: usize, function: F)
+where
+    A: Allocator + Clone,
+    F: Fn(Prong, usize) + Sync,
+{
+    assert!(pool.thread_count() != 0, "Thread pool not initialized");
+    if n == 0 {
+        return;
+    }
+    let threads = pool.thread_count();
+    if threads == 1 || n == 1 {
+        function(
+            Prong {
+                thread_index: 0,
+                task_index: 0,
+            },
+            n,
+        );
+        return;
+    }
+
+    let tasks_per_thread_lower_bound = n / threads;
+    let tasks_per_thread =
+        tasks_per_thread_lower_bound + ((tasks_per_thread_lower_bound * threads) < n) as usize;
+
+    pool.broadcast(|thread_index| {
+        let begin = thread_index * tasks_per_thread;
+        let begin_lower_bound = tasks_per_thread_lower_bound * thread_index;
+        let begin_overflows = begin_lower_bound > begin;
+        let begin_exceeds = begin >= n;
+        if begin_overflows || begin_exceeds {
+            return;
+        }
+        let count = std::cmp::min(begin.saturating_add(tasks_per_thread), n) - begin;
+        function(
+            Prong {
+                thread_index,
+                task_index: begin,
+            },
+            count,
+        );
+    });
+}
+
+/// Distributes `n` similar duration calls between threads by individual indices.
+pub fn for_n<A, F>(pool: &ThreadPool<A>, n: usize, function: F)
+where
+    A: Allocator + Clone,
+    F: Fn(Prong) + Sync,
+{
+    for_slices(pool, n, |start_prong, count| {
+        for offset in 0..count {
+            function(Prong {
+                thread_index: start_prong.thread_index,
+                task_index: start_prong.task_index + offset,
+            });
+        }
+    });
+}
+
+/// Executes `n` uneven tasks on all threads, greedily stealing work.
+pub fn for_n_dynamic<A, F>(pool: &ThreadPool<A>, n: usize, function: F)
+where
+    A: Allocator + Clone,
+    F: Fn(Prong) + Sync,
+{
+    let prongs_count = n;
+    if prongs_count == 0 {
+        return;
+    }
+    if prongs_count == 1 {
+        function(Prong {
+            thread_index: 0,
+            task_index: 0,
+        });
+        return;
+    }
+    let threads = pool.thread_count();
+    if threads == 1 {
+        for i in 0..prongs_count {
+            function(Prong {
+                thread_index: 0,
+                task_index: i,
+            });
+        }
+        return;
+    }
+
+    let prongs_static = threads;
+    if prongs_count <= prongs_static {
+        return for_n(pool, prongs_count, function);
+    }
+
+    let prongs_dynamic = prongs_count - prongs_static;
+    let progress = Padded::new(AtomicUsize::new(0));
+    pool.broadcast(|thread_index| {
+        let static_index = prongs_dynamic + thread_index;
+        let mut prong = Prong {
+            thread_index,
+            task_index: static_index,
+        };
+        function(prong);
+        loop {
+            let idx = progress.fetch_add(1, Ordering::AcqRel);
+            if idx >= prongs_dynamic {
+                break;
+            }
+            prong.task_index = idx;
+            function(prong);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -484,7 +486,7 @@ mod tests {
 
     #[test]
     fn spawn_with_allocator() {
-        let pool = ForkUnion::try_spawn_in(2, Global).expect("spawn");
+        let pool = ThreadPool::try_spawn_in(2, Global).expect("spawn");
         assert_eq!(pool.thread_count(), 2);
     }
 
@@ -500,7 +502,7 @@ mod tests {
         );
         let visited_ref = Arc::clone(&visited);
 
-        pool.for_each_thread(move |thread_index| {
+        pool.broadcast(move |thread_index| {
             visited_ref[thread_index].store(true, Ordering::Relaxed);
         });
 
@@ -519,7 +521,8 @@ mod tests {
 
         for input_size in 0..count_threads {
             let out_of_bounds = AtomicBool::new(false);
-            pool.for_each_static(input_size, |task_index| {
+            for_n(&pool, input_size, |prong| {
+                let task_index = prong.task_index;
                 if task_index >= count_threads {
                     out_of_bounds.store(true, Ordering::Relaxed);
                 }
@@ -545,7 +548,8 @@ mod tests {
         let visited_ref = Arc::clone(&visited);
         let duplicate_ref = Arc::clone(&duplicate);
 
-        pool.for_each_static(EXPECTED_PARTS, move |task_index| {
+        for_n(&pool, EXPECTED_PARTS, move |prong| {
+            let task_index = prong.task_index;
             if visited_ref[task_index].swap(true, Ordering::Relaxed) {
                 duplicate_ref.store(true, Ordering::Relaxed);
             }
@@ -574,7 +578,8 @@ mod tests {
         let visited_ref = Arc::clone(&visited);
         let duplicate_ref = Arc::clone(&duplicate);
 
-        pool.for_each_dynamic(EXPECTED_PARTS, move |task_index| {
+        for_n_dynamic(&pool, EXPECTED_PARTS, move |prong| {
+            let task_index = prong.task_index;
             if visited_ref[task_index].swap(true, Ordering::Relaxed) {
                 duplicate_ref.store(true, Ordering::Relaxed);
             }
@@ -607,7 +612,8 @@ mod tests {
 
         thread_local! { static LOCAL_WORK: std::cell::Cell<usize> = std::cell::Cell::new(0); }
 
-        pool.for_each_dynamic(EXPECTED_PARTS, move |task_index| {
+        for_n_dynamic(&pool, EXPECTED_PARTS, move |prong| {
+            let task_index = prong.task_index;
             // Mildly unbalanced CPU burn
             LOCAL_WORK.with(|cell| {
                 let mut acc = cell.get();
@@ -642,7 +648,7 @@ mod tests {
 
         TASK_COUNTER.store(0, Ordering::Relaxed);
         let pool = spawn(hw_threads());
-        pool.for_each_dynamic(EXPECTED_PARTS, tally as fn(usize));
+        for_n_dynamic(&pool, EXPECTED_PARTS, |prong| tally(prong.task_index));
 
         assert_eq!(
             TASK_COUNTER.load(Ordering::Relaxed),
@@ -665,7 +671,8 @@ mod tests {
         );
         let hist_ref = Arc::clone(&histogram);
 
-        pool.for_each_dynamic(ELEMENTS, |task_index| {
+        for_n_dynamic(&pool, ELEMENTS, |prong| {
+            let task_index = prong.task_index;
             let value = values[task_index];
             hist_ref[value].fetch_add(1, Ordering::Relaxed);
         });
@@ -679,9 +686,9 @@ mod tests {
         }
     }
 
-    fn increment_all(pool: &ForkUnion, data: &[AtomicUsize]) {
-        pool.for_each_static(data.len(), |i| {
-            data[i].fetch_add(1, Ordering::Relaxed);
+    fn increment_all(pool: &ThreadPool, data: &[AtomicUsize]) {
+        for_n(pool, data.len(), |prong| {
+            data[prong.task_index].fetch_add(1, Ordering::Relaxed);
         });
     }
 
@@ -707,7 +714,7 @@ mod tests {
         let mut pool = spawn(hw_threads());
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-        pool.for_each_static(1000, |_| {
+        for_n(&pool, 1000, |_| {
             COUNTER.fetch_add(1, Ordering::Relaxed);
         });
 
@@ -816,12 +823,12 @@ mod tests {
 
         let small_allocator = CountingAllocator::new(Some(MINIMAL_NEEDED_SIZE - 1));
         assert!(
-            ForkUnion::try_spawn_in(hw_threads(), small_allocator.clone()).is_err(),
+            ThreadPool::try_spawn_in(hw_threads(), small_allocator.clone()).is_err(),
             "We should not be able to spawn a pool with a small allocator"
         );
 
         let large_allocator = CountingAllocator::new(Some(1024 * 1024));
-        let pool = ForkUnion::try_spawn_in(hw_threads(), large_allocator.clone())
+        let pool = ThreadPool::try_spawn_in(hw_threads(), large_allocator.clone())
             .expect("We should have enough memory for this!");
 
         let visited = Arc::new(
@@ -833,7 +840,8 @@ mod tests {
         let visited_ref = Arc::clone(&visited);
         let duplicate_ref = Arc::clone(&duplicate);
 
-        pool.for_each_dynamic(EXPECTED_PARTS, move |task_index| {
+        for_n_dynamic(&pool, EXPECTED_PARTS, move |prong| {
+            let task_index = prong.task_index;
             if visited_ref[task_index].swap(true, Ordering::Relaxed) {
                 duplicate_ref.store(true, Ordering::Relaxed);
             }
