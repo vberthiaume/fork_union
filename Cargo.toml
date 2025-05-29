@@ -1,7 +1,7 @@
 [package]
 name = "fork_union"
-description = "Minimalistic scoped thread-pool designed for SIMT-style 'Fork-Join' parallelism"
-version = "0.3.2"
+description = "OpenMP-style cross-platform fine-grained parallelism library"
+version = "1.0.0"
 edition = "2021"
 authors = ["Ash Vardanian"]
 license = "Apache-2.0"
@@ -9,3 +9,13 @@ repository = "https://github.com/ashvardanian/fork_union"
 
 [lib]
 path = "fork_union.rs"
+
+[[example]]
+name = "nbody"
+path = "scripts/nbody.rs"
+test = false
+bench = false
+
+[dev-dependencies]
+rayon = "1.10"
+rand = "0.9"

@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.14)
 
 project(
     fork_union
-    VERSION 0.3.2
-    DESCRIPTION "Minimalistic C++ thread-pool designed for SIMT-style 'Fork-Join' parallelism"
+    VERSION 1.0.0
+    DESCRIPTION "OpenMP-style cross-platform fine-grained parallelism library"
     LANGUAGES CXX
 )
 
