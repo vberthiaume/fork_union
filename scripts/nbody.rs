@@ -11,20 +11,20 @@
 //! To compile and run:
 //!
 //! ```sh
-//! cargo +nightly run --example nbody --release
+//! cargo run --example nbody --release
 //! ```
 //!
 //! The default profiling scheme is to 1M iterations for 128 particles on each backend:
 //!
 //! ```sh
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=rayon_static cargo +nightly run --example nbody --release
+//!     NBODY_BACKEND=rayon_static cargo run --example nbody --release
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=rayon_dynamic cargo +nightly run --example nbody --release
+//!     NBODY_BACKEND=rayon_dynamic cargo run --example nbody --release
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=fork_union_static cargo +nightly run --example nbody --release
+//!     NBODY_BACKEND=fork_union_static cargo run --example nbody --release
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=fork_union_dynamic cargo +nightly run --example nbody --release
+//!     NBODY_BACKEND=fork_union_dynamic cargo run --example nbody --release
 //! ```
 use rand::{rng, Rng};
 use std::env;

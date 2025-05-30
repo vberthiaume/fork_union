@@ -287,7 +287,7 @@ build_debug/scripts/fork_union_test_cpp20
 For Rust, use the following command:
 
 ```bash
-rustup toolchain install nightly  # for Alloc API
-cargo +nightly miri test          # to catch UBs
-cargo +nightly test --release     # to run the tests fast
+rustup toolchain install # for Alloc API
+cargo miri test          # to catch UBs
+cargo test --release     # to run the tests fast
 ```
