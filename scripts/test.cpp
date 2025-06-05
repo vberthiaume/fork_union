@@ -37,6 +37,27 @@ static bool test_broadcast() noexcept {
     return true;
 }
 
+/** @brief Shows how to control multiple thread-pools from the same main thread. */
+static bool test_exclusivity() noexcept {
+    constexpr std::size_t count_threads = 4;
+    std::vector<std::atomic<bool>> visited(count_threads);
+    {
+        fu::thread_pool_t first_pool, second_pool;
+        if (!first_pool.try_spawn(2, fu::caller_inclusive_k)) return false;
+        if (!second_pool.try_spawn(2, fu::caller_exclusive_k)) return false;
+        auto join_second = second_pool.broadcast([&](std::size_t const thread_index) noexcept {
+            visited[2 + thread_index].store(true, std::memory_order_relaxed);
+        });
+        first_pool.broadcast([&](std::size_t const thread_index) noexcept {
+            visited[thread_index].store(true, std::memory_order_relaxed);
+        });
+        join_second.wait();
+    }
+    for (std::size_t i = 0; i < count_threads; ++i)
+        if (!visited[i]) return false;
+    return true;
+}
+
 /** @brief Make sure that `for_n` is called from each thread. */
 static bool test_uncomfortable_input_size() noexcept {
     std::size_t const count_threads = std::thread::hardware_concurrency();
@@ -240,6 +261,7 @@ int main() {
         {"`try_spawn` normal", test_try_spawn_success},                                     //
         {"`try_spawn` zero threads", test_try_spawn_zero},                                  //
         {"`broadcast` dispatch", test_broadcast},                                           //
+        {"`caller_exclusive_k` calls", test_exclusivity},                                   //
         {"`for_n` for uncomfortable input size", test_uncomfortable_input_size},            //
         {"`for_n` static scheduling", test_for_n},                                          //
         {"`for_n_dynamic` dynamic scheduling", test_for_n_dynamic},                         //
