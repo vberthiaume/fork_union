@@ -68,8 +68,13 @@
  */
 #define _FU_DETECT_CPP_20 (__cplusplus >= 202002L)
 #define _FU_DETECT_CPP_17 (__cplusplus >= 201703L)
+
 #if _FU_DETECT_CPP_17
 #include <type_traits> // `std::is_nothrow_invocable_r`
+#endif
+
+#if _FU_DETECT_CPP_20
+#include <concepts> // `std::same_as`, `std::invocable`
 #endif
 
 #if _FU_DETECT_CPP_17
@@ -471,6 +476,36 @@ class thread_pool {
 
 using thread_pool_t = thread_pool<std::allocator<std::thread>>;
 
+#pragma region Concepts
+#if _FU_DETECT_CPP_20
+
+struct broadcasted_noop_t {
+    template <typename index_type_>
+    void operator()(index_type_) const noexcept
+        requires(std::unsigned_integral<index_type_> && std::convertible_to<index_type_, std::size_t>)
+    {}
+};
+
+template <typename pool_type_>
+concept is_pool = //
+    std::unsigned_integral<decltype(std::declval<pool_type_ const &>().threads_count())> &&
+    std::convertible_to<decltype(std::declval<pool_type_ const &>().threads_count()), std::size_t> &&
+    requires(pool_type_ &p) {
+        { p.broadcast(broadcasted_noop_t {}) };
+    };
+
+template <typename pool_type_>
+concept is_unsafe_pool =   //
+    is_pool<pool_type_> && //
+    requires(pool_type_ &p) {
+        { p.unsafe_broadcast(broadcasted_noop_t {}) } -> std::same_as<void>;
+    } && //
+    requires(pool_type_ &p) {
+        { p.unsafe_join() } -> std::same_as<typename pool_type_::broadcast_join_t>;
+    };
+
+#endif
+#pragma endregion Concepts
 #pragma endregion - Thread Pool
 
 #pragma region - Indexed Tasks
