@@ -46,6 +46,10 @@
 #include <cassert> // `assert`
 #include <new>     // `std::hardware_destructive_interference_size`
 
+#define FORK_UNION_VERSION_MAJOR 1
+#define FORK_UNION_VERSION_MINOR 0
+#define FORK_UNION_VERSION_PATCH 2
+
 #if !defined(FU_ALLOW_UNSAFE)
 #define FU_ALLOW_UNSAFE 0
 #endif
@@ -80,6 +84,12 @@
 #endif
 #endif
 
+#if _FU_DETECT_CPP_20
+#define _FU_UNLIKELY [[unlikely]]
+#else
+#define _FU_UNLIKELY
+#endif
+
 namespace ashvardanian {
 namespace fork_union {
 
@@ -107,6 +117,23 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
     return (std::numeric_limits<scalar_type_>::max() - a < b) ? std::numeric_limits<scalar_type_>::max() : a + b;
 #endif
 }
+
+/**
+ *  @brief Defines the in- and exclusivity of the calling thread in for the executing task.
+ *  @sa caller_inclusive_k and caller_exclusive_k
+ *
+ *  This enum affects how the join is performed. If the caller is inclusive, 1/Nth of the call
+ *  will be executed by the calling thread (as opposed to workers) and the join will happen
+ *  inside of the calling scope.
+ */
+enum caller_exclusivity_t {
+    caller_inclusive_k,
+    caller_exclusive_k,
+};
+
+struct standard_yield_t {
+    void operator()() const noexcept { std::this_thread::yield(); }
+};
 
 #pragma region - Thread Pool
 
@@ -144,17 +171,25 @@ inline scalar_type_ add_sat(scalar_type_ a, scalar_type_ b) noexcept {
  *  int main() {
  *      fu::thread_pool<> pool; // ? Or `fu::thread_pool_t` alias
  *      if (!pool.try_spawn(std::thread::hardware_concurrency())) return EXIT_FAILURE;
- *      pool.broadcast([](std::size_t index) { std::printf("Hello from thread %zu\n", index); });
+ *      pool.broadcast([](std::size_t index) noexcept { std::printf("Hello from thread %zu\n", index); });
  *      return EXIT_SUCCESS;
  *  }
  *  @endcode
  *
- *  @param allocator_type_ The type of the allocator to be used for the thread pool.
- *  @param index_type_ Defaults to `std::size_t`, but can be changed to a smaller type for debugging.
- *  @param alignment_ The alignment of the thread pool. Defaults to `default_alignment_k`.
+ *  Unlike OpenMP, however, separate thread-pools can be created isolating work and resources.
+ *  This is handy when when some logic has to be split between "performance" and "efficiency" cores,
+ *  between different NUMA nodes, between GUI and background tasks, etc.
+ *
+ *
+ *
+ *  @tparam allocator_type_ The type of the allocator to be used for the thread pool.
+ *  @tparam yield_type_ The type of the yield function to be used for busy-waiting.
+ *  @tparam index_type_ Defaults to `std::size_t`, but can be changed to a smaller type for debugging.
+ *  @tparam alignment_ The alignment of the thread pool. Defaults to `default_alignment_k`.
  */
 template <                                                  //
     typename allocator_type_ = std::allocator<std::thread>, //
+    typename yield_type_ = standard_yield_t,                //
     typename index_type_ = std::size_t,                     //
     std::size_t alignment_ = default_alignment_k            //
     >
@@ -162,13 +197,14 @@ class thread_pool {
 
   public:
     using allocator_t = allocator_type_;
+    using yield_t = yield_type_;
     static constexpr std::size_t alignment_k = alignment_;
     static_assert(alignment_k > 0 && (alignment_k & (alignment_k - 1)) == 0, "Alignment must be a power of 2");
 
     using index_t = index_type_;
     static_assert(std::is_unsigned<index_t>::value, "Index type must be an unsigned integer");
-    using generation_index_t = index_t; // ? A.k.a. number of previous API calls in [0, UINT_MAX)
-    using thread_index_t = index_t;     // ? A.k.a. "core index" or "thread ID" in [0, threads_count)
+    using epoch_index_t = index_t;  // ? A.k.a. number of previous API calls in [0, UINT_MAX)
+    using thread_index_t = index_t; // ? A.k.a. "core index" or "thread ID" in [0, threads_count)
 
     using punned_fork_context_t = void const *;                           // ? Pointer to the on-stack lambda
     using trampoline_t = void (*)(punned_fork_context_t, thread_index_t); // ? Wraps lambda's `operator()`
@@ -178,6 +214,7 @@ class thread_pool {
     allocator_t allocator_ {};
     std::thread *workers_ {nullptr};
     thread_index_t threads_count_ {0};
+    caller_exclusivity_t exclusivity_ {caller_inclusive_k}; // ? Whether the caller thread is included in the count
 
     /**
      *  Theoretically, the choice of `std::atomic<bool>` is suboptimal in the presence of `std::atomic_flag`.
@@ -185,13 +222,13 @@ class thread_pool {
      *  have a non-modifying load operation - the `std::atomic_flag::test` was added in C++20.
      *  @see https://en.cppreference.com/w/cpp/atomic/atomic_flag.html
      */
-    alignas(alignment_) std::atomic<bool> stop_ {false};
+    alignas(alignment_) std::atomic<bool> terminate_ {false};
 
     // Task-specific variables:
-    punned_fork_context_t fork_lambda_pointer_ {nullptr}; // ? Pointer to the users lambda
-    trampoline_t fork_trampoline_pointer_ {nullptr};      // ? Calls the lambda
+    punned_fork_context_t fork_state_ {nullptr}; // ? Pointer to the users lambda
+    trampoline_t fork_trampoline_ {nullptr};     // ? Calls the lambda
     alignas(alignment_) std::atomic<thread_index_t> threads_to_sync_ {0};
-    alignas(alignment_) std::atomic<generation_index_t> fork_generation_ {0};
+    alignas(alignment_) std::atomic<epoch_index_t> epoch_ {0};
 
   public:
     thread_pool(thread_pool &&) = delete;
@@ -200,40 +237,50 @@ class thread_pool {
     thread_pool &operator=(thread_pool const &) = delete;
 
     thread_pool(allocator_t const &alloc = {}) noexcept : allocator_(alloc) {}
-    ~thread_pool() noexcept { stop_and_reset(); }
+    ~thread_pool() noexcept { terminate_and_reset(); }
 
     /**
      *  @brief Returns the number of threads in the thread-pool, including the main thread.
      *  @retval 0 if the thread-pool is not initialized, 1 if only the main thread is used.
-     *  @note This API is not synchronized and is expected to be called only from the main thread.
+     *  @note This API is @b not synchronized.
      */
-    thread_index_t threads() const noexcept { return threads_count_; }
+    thread_index_t threads_count() const noexcept { return threads_count_; }
 
-    /** @brief Estimates the amount of memory managed by this pool handle and internal structures. */
+    /**
+     *  @brief Reports if the current calling thread will be used for broadcasts.
+     *  @note This API is @b not synchronized.
+     */
+    caller_exclusivity_t caller_exclusivity() const noexcept { return exclusivity_; }
+
+    /** @brief Estimates the amount of memory managed by this pool handle and internal structures.
+     *  @note This API is @b not synchronized.
+     */
     std::size_t memory_usage() const noexcept { return sizeof(thread_pool) + threads() * sizeof(std::thread); }
 
     /** @brief Checks if the thread-pool's core synchronization points are lock-free. */
-    bool is_lock_free() const noexcept {
-        return stop_.is_lock_free() && threads_to_sync_.is_lock_free() && fork_generation_.is_lock_free();
-    }
+    bool is_lock_free() const noexcept { return terminate_.is_lock_free() && threads_to_sync_.is_lock_free(); }
 
     /**
      *  @brief Creates a thread-pool with the given number of threads.
-     *  @note This is the de-facto @b constructor, and can only be called once.
-     *  @param[in] planned_threads The number of threads to be used. Should be larger than one.
+     *  @param[in] threads The number of threads to be used. Should be larger than one.
+     *  @param[in] exclusivity Should we count the calling thread as one of the threads?
      *  @retval false if the number of threads is zero or the "workers" allocation failed.
      *  @retval true if the thread-pool was created successfully, started, and is ready to use.
+     *  @note This is the de-facto @b constructor - you only call it again after `terminate`.
      */
-    bool try_spawn(thread_index_t const planned_threads) noexcept {
-        if (planned_threads == 0) return false; // ! Can't have zero threads working on something
-        if (threads_count_ != 0) return false;  // ! Already initialized
-        if (planned_threads == 1) {
+    bool try_spawn(thread_index_t const threads, caller_exclusivity_t const exclusivity = caller_inclusive_k) noexcept {
+
+        if (threads == 0) return false;        // ! Can't have zero threads working on something
+        if (threads_count_ != 0) return false; // ! Already initialized
+
+        bool const use_caller_thread = exclusivity == caller_inclusive_k;
+        if (threads == 1 && use_caller_thread) {
             threads_count_ = 1;
             return true; // ! The current thread will always be used
         }
 
         // Allocate the thread pool
-        thread_index_t const worker_threads = planned_threads - 1;
+        thread_index_t const worker_threads = threads - use_caller_thread;
         std::thread *const workers = allocator_.allocate(worker_threads);
         if (!workers) return false; // ! Allocation failed
 
@@ -242,7 +289,7 @@ class thread_pool {
         // https://en.cppreference.com/w/cpp/thread/thread/thread
         for (thread_index_t i = 0; i < worker_threads; ++i) {
             try {
-                new (&workers[i]) std::thread([this, i] { _worker_loop(i + 1); });
+                new (&workers[i]) std::thread([this, i] { _worker_loop(i + use_caller_thread); });
             }
             catch (...) {
                 for (thread_index_t j = 0; j < i; ++j) workers[j].~thread();
@@ -253,27 +300,112 @@ class thread_pool {
 
         // If all went well, we can store the thread-pool and start using it
         workers_ = workers;
-        threads_count_ = planned_threads;
+        threads_count_ = threads;
         return true;
     }
 
     /**
-     *  @brief Stops all threads and deallocates the thread-pool. Must `try_spawn` again to re-use.
-     *  @note Can't be called while any tasks are running.
+     *  @brief A synchronization point that waits for all threads to finish the last broadcasted call.
+     *
+     *  You don't have to explicitly handle the return value and wait on it.
+     *  According to the  C++ standard, the destructor of the `broadcast_join_t` will be called
+     *  in the end of the `broadcast`-calling expression.
      */
-    void stop_and_reset() noexcept {
+    class broadcast_join_t {
+        std::atomic<thread_index_t> &threads_to_sync_;
+
+      public:
+        explicit broadcast_join_t(std::atomic<thread_index_t> &sync) noexcept : threads_to_sync_(sync) {}
+        broadcast_join_t(broadcast_join_t &&) = default;
+        broadcast_join_t(broadcast_join_t const &) = delete;
+        broadcast_join_t &operator=(broadcast_join_t &&) = default;
+        broadcast_join_t &operator=(broadcast_join_t const &) = delete;
+        ~broadcast_join_t() noexcept { wait(); }
+        void wait() const noexcept {
+            yield_t yield;
+            while (threads_to_sync_.load(std::memory_order_acquire)) yield();
+        }
+    };
+
+    /**
+     *  @brief Executes a @p function in parallel on all threads.
+     *  @param[in] function The callback, receiving the thread index as an argument.
+     *  @return A `broadcast_join_t` synchronization point that waits in the destructor.
+     *  @note Even in the `caller_exclusive_k` mode, can be called from just one thread!
+     *  @sa For advanced resource management, consider `unsafe_broadcast` and `unsafe_join`.
+     */
+    template <typename function_type_>
+    broadcast_join_t broadcast(function_type_ const &function) noexcept {
+        unsafe_broadcast(function);
+        return unsafe_join();
+    }
+
+    /**
+     *  @brief Executes a @p function in parallel on all threads, not waiting for the result.
+     *  @param[in] function The callback, receiving the thread index as an argument.
+     *  @sa Use in conjunction with `unsafe_join`.
+     */
+    template <typename function_type_>
+    void unsafe_broadcast(function_type_ const &function) noexcept {
+
+        thread_index_t const threads = threads_count();
+        assert(threads != 0 && "Thread pool not initialized");
+        caller_exclusivity_t const exclusivity = caller_exclusivity();
+        bool const use_caller_thread = exclusivity == caller_inclusive_k;
+        if (threads == 1 && use_caller_thread) return function(static_cast<thread_index_t>(0));
+
+        // Optional check: even in exclusive mode, only one thread can call this function.
+        assert((use_caller_thread || threads_to_sync_.load(std::memory_order_acq_rel) == 0) &&
+               "The broadcast function can be called only from one thread at a time");
+
+#if _FU_DETECT_CPP_17
+        // ? Exception handling and aggregating return values drastically increases code complexity
+        // ? we live to the higher-level algorithms.
+        static_assert(std::is_nothrow_invocable_r<void, function_type_, thread_index_t>::value,
+                      "The callback must be invocable with a `thread_index_t` argument");
+#endif
+
+        // Configure "fork" details
+        fork_state_ = std::addressof(function);
+        fork_trampoline_ = &_call_as_lambda<function_type_>;
+        threads_to_sync_.store(threads - use_caller_thread, std::memory_order_relaxed);
+        epoch_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
+
+        // Execute on the current "main" thread
+        if (use_caller_thread) function(static_cast<thread_index_t>(0));
+    }
+
+    /** @brief Blocks the calling thread until the currently broadcasted task finishes. */
+    broadcast_join_t unsafe_join() noexcept { return broadcast_join_t(threads_to_sync_); }
+
+    /**
+     *  @brief Stops all threads and deallocates the thread-pool after the last call finishes.
+     *  @note Can be called from any thread at any time.
+     *  @note Must `try_spawn` again to re-use the pool.
+     *
+     *  When and how @b NOT to use this function:
+     *  - as a synchronization point between concurrent tasks.
+     *
+     *  When and how to use this function:
+     *  - as a de-facto @b destructor, to stop all threads and deallocate the pool.
+     *  - when you want to @b restart with a different number of threads.
+     */
+    void terminate() noexcept {
         if (threads_count_ == 0) return; // ? Uninitialized
-        if (threads_count_ == 1) {
+
+        caller_exclusivity_t const exclusivity = caller_exclusivity();
+        bool const use_caller_thread = exclusivity == caller_inclusive_k;
+        if (threads_count_ == 1 && use_caller_thread) {
             threads_count_ = 0;
             return; // ? No worker threads to join
         }
         assert(threads_to_sync_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
 
         // Stop all threads and wait for them to finish
-        _reset_fork_description();
-        stop_.store(true, std::memory_order_release);
+        _reset_fork();
+        terminate_.store(true, std::memory_order_release);
 
-        thread_index_t const worker_threads = threads_count_ - 1;
+        thread_index_t const worker_threads = threads_count_ - use_caller_thread;
         for (thread_index_t i = 0; i != worker_threads; ++i) {
             workers_[i].join();    // ? Wait for the thread to finish
             workers_[i].~thread(); // ? Call destructor
@@ -285,47 +417,14 @@ class thread_pool {
         // Prepare for future spawns
         threads_count_ = 0;
         workers_ = nullptr;
-        stop_.store(false, std::memory_order_relaxed);
-        fork_generation_.store(0, std::memory_order_relaxed);
-    }
-
-    /**
-     *  @brief Executes a function in parallel on the current and all worker threads.
-     *  @param[in] function The callback, receiving the thread index as an argument.
-     */
-    template <typename function_type_>
-    void broadcast(function_type_ const &function) noexcept {
-        thread_index_t const threads_count = threads();
-        assert(threads_count != 0 && "Thread pool not initialized");
-        if (threads_count == 1) return function(static_cast<thread_index_t>(0));
-
-#if _FU_DETECT_CPP_17
-        // ? Exception handling and aggregating return values drastically increases code complexity
-        // ? we live to the higher-level algorithms.
-        static_assert(std::is_nothrow_invocable_r<void, function_type_, thread_index_t>::value,
-                      "The callback must be invocable with a `thread_index_t` argument");
-#endif
-
-        // Configure "fork" details
-        fork_lambda_pointer_ = std::addressof(function);
-        fork_trampoline_pointer_ = &_call_as_lambda<function_type_>;
-        threads_to_sync_.store(threads_count - 1, std::memory_order_relaxed);
-        fork_generation_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
-
-        // Execute on the current "main" thread
-        function(static_cast<thread_index_t>(0));
-
-        // Wait until all threads are done
-        while (threads_to_sync_.load(std::memory_order_acquire)) std::this_thread::yield();
-
-        // An optional reset of the task variables for debuggability
-        _reset_fork_description();
+        terminate_.store(false, std::memory_order_relaxed);
+        epoch_.store(0, std::memory_order_relaxed);
     }
 
   private:
-    void _reset_fork_description() noexcept {
-        fork_lambda_pointer_ = nullptr;
-        fork_trampoline_pointer_ = nullptr;
+    void _reset_fork() noexcept {
+        fork_state_ = nullptr;
+        fork_trampoline_ = nullptr;
     }
 
     /**
@@ -344,26 +443,23 @@ class thread_pool {
      *  @param[in] thread_index The index of the thread that is executing this function.
      */
     void _worker_loop(thread_index_t const thread_index) noexcept {
-        generation_index_t last_fork_generation = 0;
+        epoch_index_t last_epoch = 0;
         assert(thread_index != 0 && "The zero index is for the main thread, not worker!");
 
         while (true) {
             // Wait for either: a new ticket or a stop flag
-            generation_index_t new_fork_generation;
-            bool wants_to_stop;
-            while ((new_fork_generation = fork_generation_.load(std::memory_order_acquire)) == last_fork_generation &&
-                   (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
-                std::this_thread::yield();
+            epoch_index_t new_epoch;
+            bool wants_to_terminate;
+            yield_t yield;
+            while ((new_epoch = epoch_.load(std::memory_order_acquire)) == last_epoch &&
+                   (wants_to_terminate = terminate_.load(std::memory_order_acquire)) == false)
+                yield();
 
-#if _FU_DETECT_CPP_20
-            if (wants_to_stop) [[unlikely]] // Attributes require C++20
-                return;
-#else
-            if (wants_to_stop) return;
-#endif
+            if (wants_to_terminate) _FU_UNLIKELY
+            return;
 
-            fork_trampoline_pointer_(fork_lambda_pointer_, thread_index);
-            last_fork_generation = new_fork_generation;
+            fork_trampoline_(fork_state_, thread_index);
+            last_epoch = new_epoch;
 
             // ! The decrement must come after the task is executed
             _FU_MAYBE_UNUSED thread_index_t const before_decrement =
