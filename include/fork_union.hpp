@@ -1,5 +1,5 @@
 /**
- *  @brief  OpenMP-style cross-platform fine-grained parallelism library.
+ *  @brief  OpenMP-style NUMA-aware cross-platform fine-grained parallelism library.
  *  @file   fork_union.hpp
  *  @author Ash Vardanian
  *  @date   May 2, 2025
@@ -54,13 +54,22 @@
 #define FU_ALLOW_UNSAFE 0
 #endif
 
+#if !defined(FU_ENABLE_NUMA)
+#if defined(__linux__) && defined(__GLIBC__)
+#define FU_ENABLE_NUMA 1
+#else
+#define FU_ENABLE_NUMA 0
+#endif
+#endif
+
 #if FU_ALLOW_UNSAFE
 #include <exception> // `std::exception_ptr`
 #endif
 
-#define FORK_UNION_VERSION_MAJOR 1
-#define FORK_UNION_VERSION_MINOR 0
-#define FORK_UNION_VERSION_PATCH 2
+#if FU_ENABLE_NUMA
+#include <numa.h>    // `numa_available`, `numa_node_of_cpu`, `numa_alloc_onnode`
+#include <pthread.h> // `pthread_getaffinity_np`
+#endif
 
 /**
  *  On C++17 and later we can detect misuse of lambdas that are not properly annotated.
@@ -90,9 +99,9 @@
 #endif
 
 #if _FU_DETECT_CPP_20
-#define _FU_UNLIKELY [[unlikely]]
+#define _FU_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
-#define _FU_UNLIKELY
+#define _FU_UNLIKELY(x) (x)
 #endif
 
 namespace ashvardanian {
@@ -505,7 +514,7 @@ class thread_pool {
     }
 };
 
-using thread_pool_t = thread_pool<std::allocator<std::thread>>;
+using thread_pool_t = thread_pool<>;
 
 #pragma region Concepts
 #if _FU_DETECT_CPP_20
@@ -538,6 +547,200 @@ concept is_unsafe_pool =   //
 #endif
 #pragma endregion Concepts
 #pragma endregion - Thread Pool
+
+#pragma region - Hardware Friendly Yield
+
+#pragma endregion - Hardware Friendly Yield
+
+#pragma region - NUMA Pools
+#if FU_ENABLE_NUMA
+
+/**
+ *  @brief NUMA topology descriptor: describing memory pools and core counts next to them.
+ *
+ *  Uses dynamic memory to store the NUMA nodes and their cores. Assuming we may soon have
+ *  Intel "Sierra Forest"-like CPUs with 288 cores with up to 8 sockets per node, this structure
+ *  can easily grow to 10 KB.
+ */
+template <typename allocator_type_ = std::allocator<char>>
+struct numa_topology {
+
+    struct numa_node_t {
+        int node_id {-1};                   // ? Unique NUMA node ID, in [0, numa_max_node())
+        std::size_t memory_size {0};        // ? RAM volume in bytes
+        int const *first_core_id {nullptr}; // ? Pointer to the first core ID in the `core_ids` array
+        std::size_t core_count {0};         // ? Number of items in `core_ids` array
+    };
+
+    using allocator_t = allocator_type_;
+    using cores_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<int>;
+    using nodes_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<numa_node_t>;
+
+  private:
+    numa_node_t *nodes_ {nullptr};
+    int *grouped_core_ids_ {nullptr}; // ? Unsigned integers in [0, threads_count), grouped by NUMA node
+    std::size_t nodes_count_ {0};     // ? Number of NUMA nodes
+    std::size_t cores_count_ {0};     // ? Total number of cores in all nodes
+    allocator_t allocator_ {};
+
+  public:
+    constexpr numa_topology() noexcept = default;
+    numa_topology(numa_topology &&o) noexcept
+        : alloc_(std::move(o.alloc_)), nodes_(o.nodes_), grouped_core_ids_(o.grouped_core_ids_),
+          nodes_count_(o.nodes_count_), cores_count_(o.cores_count_) {
+        o.nodes_ = nullptr;
+        o.grouped_core_ids_ = nullptr;
+        o.nodes_count_ = 0;
+        o.cores_count_ = 0;
+    }
+
+    numa_topology(numa_topology const &) = delete;
+    numa_topology &operator=(numa_topology const &) = delete;
+    numa_topology &operator=(numa_topology &&) = delete;
+
+    ~numa_topology() noexcept { reset(); }
+
+    void reset() noexcept {
+        cores_allocator_t cores_alloc {allocator_};
+        nodes_allocator_t nodes_alloc {allocator_};
+
+        if (grouped_core_ids_) cores_alloc.deallocate(grouped_core_ids_, cores_count_);
+        if (nodes_) nodes_alloc.deallocate(nodes_, nodes_count_);
+
+        nodes_ = nullptr;
+        grouped_core_ids_ = nullptr;
+        nodes_count_ = cores_count_ = 0;
+    }
+
+    std::size_t nodes_count() const noexcept { return nodes_count_; }
+    std::size_t threads_count() const noexcept { return cores_count_; }
+    numa_node_t node(std::size_t const node_id) const noexcept {
+        assert(node_id < nodes_count_ && "Node ID is out of bounds");
+        return nodes_[node_id];
+    }
+
+    /**
+     *  @brief Harvests CPU memory topology.
+     *  @retval false if the kernel lacks NUMA support or the harvest failed.
+     */
+    bool try_harvest() noexcept {
+        struct bitmask *numa_mask = nullptr;
+        numa_node_t *nodes_ptr = nullptr;
+        int *cores_ptr = nullptr;
+
+        if (numa_available() < 0) goto failed_harvest; // ! Linux kernel lacks NUMA support
+
+        numa_mask = numa_allocate_cpumask();
+        if (!numa_mask) goto failed_harvest; // ! Allocation failed
+
+        // We will have 2 passes over the NUMA nodes.
+        // The first one is to understand how much memory we need to allocate.
+        int const max_numa_node_id = numa_max_node();
+        std::size_t fetched_nodes = 0, fetched_cores = 0;
+        for (int node_id = 0; node_id <= max_numa_node_id; ++node_id) {
+            long long dummy;
+            if (numa_node_size64(node_id, &dummy) < 0) continue;     // ! Offline node
+            if (numa_node_to_cpus(node_id, numa_mask) < 0) continue; // ! Negative number of cores doesn't make sense
+            std::size_t const cores = static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
+            fetched_nodes += 1;
+            fetched_cores += cores;
+        }
+        if (fetched_nodes == 0) goto failed_harvest; // ! Having zero nodes is not a valid state
+
+        // Now the second pass - allocate and initialize.
+        nodes_allocator_t nodes_alloc {allocator_};
+        cores_allocator_t cores_alloc {allocator_};
+        nodes_ptr = nodes_alloc.allocate(fetched_nodes);
+        cores_ptr = cores_alloc.allocate(fetched_cores);
+        if (!nodes_ptr || !cores_ptr) goto failed_harvest; // ! Allocation failed
+
+        std::size_t core_offset = 0;
+        for (int node_id = 0; node_id <= max_numa_node_id; ++node_id) {
+            long long memory_size;
+            if (numa_node_size64(node_id, &memory_size) < 0) continue;
+            if (numa_node_to_cpus(node_id, numa_mask) < 0) continue;
+
+            numa_node_t &node = nodes_ptr[node_id];
+            node.node_id = node_id;
+            node.memory_size = static_cast<std::size_t>(memory_size);
+            node.first_core_id = cores_ptr + core_offset;
+            node.core_count = static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
+
+            for (std::size_t cpu = 0; cpu < numa_mask->size; ++cpu)
+                if (numa_bitmask_isbitset(numa_mask, cpu)) cores_ptr[core_offset++] = static_cast<int>(cpu);
+        }
+
+        // Save the harvested topology
+        nodes_ = nodes_ptr;
+        grouped_core_ids_ = cores_ptr;
+        nodes_count_ = fetched_nodes;
+        cores_count_ = fetched_cores;
+        return true;
+
+    failed_harvest:
+        if (nodes_ptr) nodes_alloc.deallocate(nodes_ptr, fetched_nodes);
+        if (cores_ptr) cores_alloc.deallocate(cores_ptr, fetched_cores);
+        if (numa_mask) numa_free_cpumask(numa_mask);
+        return false;
+    }
+};
+
+/** @brief STL-compatible allocator that puts memory on a fixed NUMA node. */
+template <typename value_type_>
+struct numa_allocator {
+    using value_type = value_type_;
+    int node_id {-1};
+
+    explicit numa_allocator(int id = -1) noexcept : node_id(id) {}
+    template <typename other_type_>
+    constexpr numa_allocator(numa_allocator<other_type_> const &o) noexcept : node_id(o.node_id) {}
+
+    value_type *allocate(std::size_t n) noexcept {
+        return static_cast<value_type *>(numa_alloc_onnode(n * sizeof(value_type), node_id));
+    }
+    void deallocate(value_type *p, std::size_t n) noexcept { numa_free(p, n * sizeof(value_type)); }
+
+    template <typename other_type_>
+    bool operator==(numa_allocator<other_type_> const &o) const noexcept {
+        return node_id == o.node_id;
+    }
+
+    template <typename other_type_>
+    bool operator!=(numa_allocator<other_type_> const &o) const noexcept {
+        return node_id != o.node_id;
+    }
+};
+
+/**
+ *  @brief A thread-pool addressing all of the threads on a certain NUMA node.
+ */
+template <                                                  //
+    typename allocator_type_ = numa_allocator<std::thread>, //
+    typename yield_type_ = standard_yield_t,                //
+    typename index_type_ = std::size_t,                     //
+    std::size_t alignment_ = default_alignment_k            //
+    >
+struct numa_thread_pool {};
+
+template <                                                  //
+    typename allocator_type_ = numa_allocator<std::thread>, //
+    typename yield_type_ = standard_yield_t,                //
+    typename index_type_ = std::size_t,                     //
+    std::size_t alignment_ = default_alignment_k            //
+    >
+struct numa_thread_pools {};
+
+using numa_thread_pool_t = numa_thread_pool<>;
+using numa_thread_pools_t = numa_thread_pools<>;
+
+static_assert(is_unsafe_pool<thread_pool_t> && is_unsafe_pool<numa_thread_pool_t>,
+              "These thread pools must be flexible and support unsafe operations");
+
+static_assert(is_pool<thread_pool_t> && is_pool<numa_thread_pool_t> && is_pool<numa_thread_pools_t>,
+              "These thread pools must be fully compatible with the high-level APIs");
+
+#endif // FU_ENABLE_NUMA
+#pragma endregion - NUMA Pools
 
 #pragma region - Indexed Tasks
 
