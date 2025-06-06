@@ -136,6 +136,16 @@ enum caller_exclusivity_t {
     caller_exclusive_k,
 };
 
+/**
+ *  @brief Defines the mood of the thread-pool, whether it is busy or about to die.
+ *  @sa mood_t::grind_k, mood_t::chill_k, mood_t::die_k
+ */
+enum class mood_t {
+    grind_k = 0, // ? That's our default ;)
+    chill_k,     // ? Sleepy and tired, but just a wake-up call away
+    die_k,       // ? The thread is about to die, we must exit the loop peacefully
+};
+
 struct standard_yield_t {
     void operator()() const noexcept { std::this_thread::yield(); }
 };
@@ -220,6 +230,7 @@ class thread_pool {
     std::thread *workers_ {nullptr};
     thread_index_t threads_count_ {0};
     caller_exclusivity_t exclusivity_ {caller_inclusive_k}; // ? Whether the caller thread is included in the count
+    std::size_t sleep_length_micros_ {0}; // ? How long to sleep in microseconds when waiting for tasks
 
     /**
      *  Theoretically, the choice of `std::atomic<bool>` is suboptimal in the presence of `std::atomic_flag`.
@@ -227,7 +238,7 @@ class thread_pool {
      *  have a non-modifying load operation - the `std::atomic_flag::test` was added in C++20.
      *  @see https://en.cppreference.com/w/cpp/atomic/atomic_flag.html
      */
-    alignas(alignment_) std::atomic<bool> terminate_ {false};
+    alignas(alignment_) std::atomic<mood_t> mood_ {mood_t::grind_k};
 
     // Task-specific variables:
     punned_fork_context_t fork_state_ {nullptr}; // ? Pointer to the users lambda
@@ -263,7 +274,7 @@ class thread_pool {
     std::size_t memory_usage() const noexcept { return sizeof(thread_pool) + threads() * sizeof(std::thread); }
 
     /** @brief Checks if the thread-pool's core synchronization points are lock-free. */
-    bool is_lock_free() const noexcept { return terminate_.is_lock_free() && threads_to_sync_.is_lock_free(); }
+    bool is_lock_free() const noexcept { return mood_.is_lock_free() && threads_to_sync_.is_lock_free(); }
 
     /**
      *  @brief Creates a thread-pool with the given number of threads.
@@ -385,7 +396,7 @@ class thread_pool {
 
     /**
      *  @brief Stops all threads and deallocates the thread-pool after the last call finishes.
-     *  @note Can be called from any thread at any time.
+     *  @note Can be called from @b any thread at any time.
      *  @note Must `try_spawn` again to re-use the pool.
      *
      *  When and how @b NOT to use this function:
@@ -408,7 +419,7 @@ class thread_pool {
 
         // Stop all threads and wait for them to finish
         _reset_fork();
-        terminate_.store(true, std::memory_order_release);
+        mood_.store(mood_t::die_k, std::memory_order_release);
 
         thread_index_t const worker_threads = threads_count_ - use_caller_thread;
         for (thread_index_t i = 0; i != worker_threads; ++i) {
@@ -422,8 +433,25 @@ class thread_pool {
         // Prepare for future spawns
         threads_count_ = 0;
         workers_ = nullptr;
-        terminate_.store(false, std::memory_order_relaxed);
+        mood_.store(mood_t::grind_k, std::memory_order_relaxed);
         epoch_.store(0, std::memory_order_relaxed);
+    }
+
+    /**
+     *  @brief Transitions "workers" to a sleeping state, waiting for a wake-up call.
+     *  @param[in] wake_up_periodicity_micros How often to check for new work in microseconds.
+     *  @note Can only be called between the tasks for a single thread. No synchronization is performed.
+     *
+     *  This function may be used in some batch-processing operations when we clearly understand
+     *  that the next task won't be arriving for a while and power can be saved without major
+     *  latency penalties.
+     *
+     *  It may also be used in a high-level Python or JavaScript library offloading some parallel
+     *  operations to an underlying C++ engine, where latency is irrelevant.
+     */
+    void sleep(std::size_t wake_up_periodicity_micros) noexcept {
+        assert(wake_up_periodicity_micros > 0 && "Sleep length must be positive");
+        sleep_length_micros_ = wake_up_periodicity_micros;
     }
 
   private:
@@ -454,14 +482,17 @@ class thread_pool {
         while (true) {
             // Wait for either: a new ticket or a stop flag
             epoch_index_t new_epoch;
-            bool wants_to_terminate;
+            mood_t mood;
             yield_t yield;
             while ((new_epoch = epoch_.load(std::memory_order_acquire)) == last_epoch &&
-                   (wants_to_terminate = terminate_.load(std::memory_order_acquire)) == false)
+                   (mood = mood_.load(std::memory_order_acquire)) == mood_t::grind_k)
                 yield();
 
-            if (wants_to_terminate) _FU_UNLIKELY
-            return;
+            if (_FU_UNLIKELY(mood == mood_t::die_k)) { return; }
+            if (_FU_UNLIKELY(mood == mood_t::chill_k)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(sleep_length_micros_));
+                continue;
+            }
 
             fork_trampoline_(fork_state_, thread_index);
             last_epoch = new_epoch;
