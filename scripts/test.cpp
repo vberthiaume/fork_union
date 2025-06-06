@@ -198,7 +198,7 @@ static bool test_mixed_restart() noexcept {
 
     // Make sure that the pool can be reset and reused
     if (should_restart_) {
-        pool.stop_and_reset();
+        pool.terminate();
         if (!pool.try_spawn(count_threads)) return false;
     }
 
@@ -251,8 +251,30 @@ static bool stress_test_composite(std::size_t const threads_count, std::size_t c
     return true;
 }
 
-int main() {
+void log_numa_topology(void) {
+#if FU_ENABLE_NUMA
+    fu::numa_topology topo;
+    if (!topo.try_harvest()) {
+        std::fprintf(stderr, "Failed to harvest NUMA topology\n");
+        return;
+    }
 
+    std::printf("Harvested NUMA topology:\n");
+    std::printf("- %zu nodes, %zu threads\n", topo.nodes_count(), topo.threads_count());
+    for (std::size_t i = 0; i < topo.nodes_count(); ++i) {
+        auto const n = topo.node(i);
+        std::printf("- node %d : %zu MiB, %zu cpus → first cpu %d\n", //
+                    n.node_id, n.memory_size >> 20, n.core_count, n.first_core_id[0]);
+    }
+#endif
+}
+
+int main(void) {
+
+    std::printf("Welcome to the Fork Union library test suite!\n");
+    log_numa_topology();
+
+    std::printf("Starting unit tests...\n");
     using test_func_t = bool() /* noexcept */;
     struct {
         char const *name;
@@ -266,8 +288,8 @@ int main() {
         {"`for_n` static scheduling", test_for_n},                                          //
         {"`for_n_dynamic` dynamic scheduling", test_for_n_dynamic},                         //
         {"`for_n_dynamic` oversubscribed threads", test_oversubscribed_unbalanced_threads}, //
-        {"`stop_and_reset` avoided", test_mixed_restart<false>},                            //
-        {"`stop_and_reset` and re-spawn", test_mixed_restart<true>},                        //
+        {"`terminate` avoided", test_mixed_restart<false>},                                 //
+        {"`terminate` and re-spawn", test_mixed_restart<true>},                             //
     };
 
     std::size_t const total_unit_tests = sizeof(unit_tests) / sizeof(unit_tests[0]);
@@ -287,6 +309,7 @@ int main() {
     std::printf("All %zu unit tests passed\n", total_unit_tests);
 
     // Start stress-testing the implementation
+    std::printf("Starting stress tests...\n");
     std::size_t const max_cores = std::thread::hardware_concurrency();
     using fu32_t = fu::thread_pool<std::allocator<std::thread>, std::uint32_t>;
     using fu16_t = fu::thread_pool<std::allocator<std::thread>, std::uint16_t>;
