@@ -111,12 +111,22 @@ namespace fork_union {
  *  @brief Defines variable alignment to avoid false sharing.
  *  @see https://en.cppreference.com/w/cpp/thread/hardware_destructive_interference_size
  *  @see https://docs.rs/crossbeam-utils/latest/crossbeam_utils/struct.CachePadded.html
+ *
+ *  The C++ STL way to do it is to use `std::hardware_destructive_interference_size` if available:
+ *
+ *  @code{.cpp}
+ *  #if defined(__cpp_lib_hardware_interference_size)
+ *  static constexpr std::size_t default_alignment_k = std::hardware_destructive_interference_size;
+ *  #else
+ *  static constexpr std::size_t default_alignment_k = alignof(std::max_align_t);
+ *  #endif
+ *  @endcode
+ *
+ *  That however results into all kinds of ABI warnings with GCC, and suboptimal alignment choice,
+ *  unless you hard-code `--param hardware_destructive_interference_size=64` or disable the warning
+ *  with `-Wno-interference-size`.
  */
-#if defined(__cpp_lib_hardware_interference_size)
-static constexpr std::size_t default_alignment_k = std::hardware_destructive_interference_size;
-#else
-static constexpr std::size_t default_alignment_k = alignof(std::max_align_t);
-#endif
+static constexpr std::size_t default_alignment_k = 128;
 
 /**
  *  @brief Defines saturated addition for a given unsigned integer type.
