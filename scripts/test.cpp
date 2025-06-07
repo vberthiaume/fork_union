@@ -263,8 +263,9 @@ void log_numa_topology(void) {
     std::printf("- %zu nodes, %zu threads\n", topo.nodes_count(), topo.threads_count());
     for (std::size_t i = 0; i < topo.nodes_count(); ++i) {
         auto const n = topo.node(i);
-        std::printf("- node %d : %zu MiB, %zu cpus → first cpu %d\n", //
-                    n.node_id, n.memory_size >> 20, n.core_count, n.first_core_id[0]);
+        std::printf("- node %d : %zu MiB, %zu cores: %d...%d\n",  //
+                    n.node_id, n.memory_size >> 20, n.core_count, //
+                    n.first_core_id[0], n.first_core_id[n.core_count - 1]);
     }
 #endif
 }
@@ -311,9 +312,9 @@ int main(void) {
     // Start stress-testing the implementation
     std::printf("Starting stress tests...\n");
     std::size_t const max_cores = std::thread::hardware_concurrency();
-    using fu32_t = fu::thread_pool<std::allocator<std::thread>, std::uint32_t>;
-    using fu16_t = fu::thread_pool<std::allocator<std::thread>, std::uint16_t>;
-    using fu8_t = fu::thread_pool<std::allocator<std::thread>, std::uint8_t>;
+    using fu32_t = fu::thread_pool<std::allocator<std::thread>, fu::standard_yield_t, std::uint32_t>;
+    using fu16_t = fu::thread_pool<std::allocator<std::thread>, fu::standard_yield_t, std::uint16_t>;
+    using fu8_t = fu::thread_pool<std::allocator<std::thread>, fu::standard_yield_t, std::uint8_t>;
     using stress_test_func_t = bool(std::size_t, std::size_t) /* noexcept */;
     struct {
         char const *name;
