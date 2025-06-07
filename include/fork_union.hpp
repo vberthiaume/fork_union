@@ -322,9 +322,11 @@ class thread_pool {
         // Initialize the thread pool can fail for all kinds of reasons,
         // that the `std::thread` documentation describes as "implementation-defined".
         // https://en.cppreference.com/w/cpp/thread/thread/thread
+        exclusivity_ = exclusivity;
         for (thread_index_t i = 0; i < worker_threads; ++i) {
             try {
-                new (&workers[i]) std::thread([this, i] { _worker_loop(i + use_caller_thread); });
+                thread_index_t const i_with_caller = i + use_caller_thread;
+                new (&workers[i]) std::thread([this, i_with_caller] { _worker_loop(i_with_caller); });
             }
             catch (...) {
                 for (thread_index_t j = 0; j < i; ++j) workers[j].~thread();
@@ -495,8 +497,9 @@ class thread_pool {
      *  @param[in] thread_index The index of the thread that is executing this function.
      */
     void _worker_loop(thread_index_t const thread_index) noexcept {
-        epoch_index_t last_epoch = 0;
-        assert(thread_index != 0 && "The zero index is for the main thread, not worker!");
+        caller_exclusivity_t const exclusivity = caller_exclusivity();
+        bool const use_caller_thread = exclusivity == caller_inclusive_k;
+        if (use_caller_thread) assert(thread_index != 0 && "The zero index is for the main thread, not worker!");
 
         while (true) {
             // Wait for either: a new ticket or a stop flag
