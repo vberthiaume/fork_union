@@ -406,7 +406,7 @@ class thread_pool {
         if (threads == 1 && use_caller_thread) return function(static_cast<thread_index_t>(0));
 
         // Optional check: even in exclusive mode, only one thread can call this function.
-        assert((use_caller_thread || threads_to_sync_.load(std::memory_order_acq_rel) == 0) &&
+        assert((use_caller_thread || threads_to_sync_.load(std::memory_order_acquire) == 0) &&
                "The broadcast function can be called only from one thread at a time");
 
 #if _FU_DETECT_CPP_17
