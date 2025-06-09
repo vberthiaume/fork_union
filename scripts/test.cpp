@@ -9,24 +9,41 @@ namespace fu = ashvardanian::fork_union;
 
 constexpr std::size_t default_parts = 10000; // 10K
 
+struct make_pool_t {
+    fu::thread_pool_t operator()() const noexcept { return fu::thread_pool_t(); }
+};
+
+#if FU_ENABLE_NUMA
+struct make_numa_pool_t {
+    fu::numa_thread_pool_t operator()() const noexcept {
+        fu::numa_topology topo;
+        assert(topo.try_harvest() && "Failed to harvest NUMA topology");
+        return fu::numa_thread_pool_t("fuma", topo.node(0));
+    }
+};
+#endif
+
+template <typename make_pool_type_ = make_pool_t>
 static bool test_try_spawn_success() noexcept {
-    fu::thread_pool_t pool;
+    auto pool = make_pool_type_ {}();
     std::size_t const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
     return true;
 }
 
+template <typename make_pool_type_ = make_pool_t>
 static bool test_try_spawn_zero() noexcept {
-    fu::thread_pool_t pool;
+    auto pool = make_pool_type_ {}();
     return !pool.try_spawn(0u);
 }
 
 /** @brief Make sure that `broadcast` is called from each thread. */
+template <typename make_pool_type_ = make_pool_t>
 static bool test_broadcast() noexcept {
     std::size_t const count_threads = std::thread::hardware_concurrency();
     std::vector<std::atomic<bool>> visited(count_threads);
     {
-        fu::thread_pool_t pool;
+        auto pool = make_pool_type_ {}();
         if (!pool.try_spawn(count_threads)) return false;
         pool.broadcast([&](std::size_t const thread_index) noexcept {
             visited[thread_index].store(true, std::memory_order_relaxed);
@@ -38,13 +55,43 @@ static bool test_broadcast() noexcept {
 }
 
 /** @brief Shows how to control multiple thread-pools from the same main thread. */
+template <typename make_pool_type_ = make_pool_t>
 static bool test_exclusivity() noexcept {
     constexpr std::size_t count_threads = 4;
     std::vector<std::atomic<bool>> visited(count_threads);
+
+    // First try with externally defined lambdas with a clearly long lifetime:
     {
-        fu::thread_pool_t first_pool, second_pool;
+        auto first_pool = make_pool_type_ {}();
+        auto second_pool = make_pool_type_ {}();
         if (!first_pool.try_spawn(2, fu::caller_inclusive_k)) return false;
         if (!second_pool.try_spawn(2, fu::caller_exclusive_k)) return false;
+        auto do_second = [&](std::size_t const thread_index) noexcept {
+            visited[2 + thread_index].store(true, std::memory_order_relaxed);
+        };
+        auto do_first = [&](std::size_t const thread_index) noexcept {
+            visited[thread_index].store(true, std::memory_order_relaxed);
+        };
+
+        // Repeat the same logic a few times and check for correctness:
+        for (std::size_t iteration = 0; iteration < 3; ++iteration) {
+            auto join_second = second_pool.broadcast(do_second);
+            first_pool.broadcast(do_first);
+            join_second.wait();
+
+            // Validate:
+            for (std::size_t i = 0; i < count_threads; ++i)
+                if (!visited[i]) return false;
+        }
+    }
+
+    // Now do the same with inline lambdas, where they should be re-packaged into returned objects:
+    {
+        auto first_pool = make_pool_type_ {}();
+        auto second_pool = make_pool_type_ {}();
+        if (!first_pool.try_spawn(2, fu::caller_inclusive_k)) return false;
+        if (!second_pool.try_spawn(2, fu::caller_exclusive_k)) return false;
+
         auto join_second = second_pool.broadcast([&](std::size_t const thread_index) noexcept {
             visited[2 + thread_index].store(true, std::memory_order_relaxed);
         });
@@ -52,17 +99,20 @@ static bool test_exclusivity() noexcept {
             visited[thread_index].store(true, std::memory_order_relaxed);
         });
         join_second.wait();
+
+        // Validate:
+        for (std::size_t i = 0; i < count_threads; ++i)
+            if (!visited[i]) return false;
     }
-    for (std::size_t i = 0; i < count_threads; ++i)
-        if (!visited[i]) return false;
     return true;
 }
 
 /** @brief Make sure that `for_n` is called from each thread. */
+template <typename make_pool_type_ = make_pool_t>
 static bool test_uncomfortable_input_size() noexcept {
     std::size_t const count_threads = std::thread::hardware_concurrency();
 
-    fu::thread_pool_t pool;
+    auto pool = make_pool_type_ {}();
     if (!pool.try_spawn(count_threads)) return false;
 
     for (std::size_t input_size = 0; input_size < count_threads; ++input_size) {
@@ -97,12 +147,13 @@ bool contains_iota(std::vector<aligned_visit_t> &visited) noexcept {
 }
 
 /** @brief Make sure that `for_n` is called the right number of times with the right prong IDs. */
+template <typename make_pool_type_ = make_pool_t>
 static bool test_for_n() noexcept {
 
     std::atomic<std::size_t> counter(0);
     std::vector<aligned_visit_t> visited(default_parts);
 
-    fu::thread_pool_t pool;
+    auto pool = make_pool_type_ {}();
     std::size_t const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
     for_n(pool, default_parts, [&](std::size_t const task_index) noexcept {
@@ -127,9 +178,10 @@ static bool test_for_n() noexcept {
 }
 
 /** @brief Make sure that `for_n_dynamic` is called the right number of times with the right prong IDs. */
+template <typename make_pool_type_ = make_pool_t>
 static bool test_for_n_dynamic() noexcept {
 
-    fu::thread_pool_t pool;
+    auto pool = make_pool_type_ {}();
     std::size_t const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
     std::vector<aligned_visit_t> visited(default_parts);
@@ -156,10 +208,11 @@ static bool test_for_n_dynamic() noexcept {
 }
 
 /** @brief Stress-tests the implementation by oversubscribing the number of threads. */
+template <typename make_pool_type_ = make_pool_t>
 static bool test_oversubscribed_unbalanced_threads() noexcept {
     constexpr std::size_t oversubscription = 3;
 
-    fu::thread_pool_t pool;
+    auto pool = make_pool_type_ {}();
     std::size_t const count_threads = std::thread::hardware_concurrency() * oversubscription;
     if (!pool.try_spawn(count_threads)) return false;
     std::vector<aligned_visit_t> visited(default_parts);
@@ -179,10 +232,10 @@ static bool test_oversubscribed_unbalanced_threads() noexcept {
 }
 
 /** @brief Make sure that that we can combine static and dynamic workloads over the same pool with & w/out resetting. */
-template <bool should_restart_>
+template <bool should_restart_, typename make_pool_type_ = make_pool_t>
 static bool test_mixed_restart() noexcept {
 
-    fu::thread_pool_t pool;
+    auto pool = make_pool_type_ {}();
     std::size_t const count_threads = std::thread::hardware_concurrency();
     if (!pool.try_spawn(count_threads)) return false;
     std::vector<aligned_visit_t> visited(default_parts);
@@ -291,6 +344,18 @@ int main(void) {
         {"`for_n_dynamic` oversubscribed threads", test_oversubscribed_unbalanced_threads}, //
         {"`terminate` avoided", test_mixed_restart<false>},                                 //
         {"`terminate` and re-spawn", test_mixed_restart<true>},                             //
+#if FU_ENABLE_NUMA && 0
+        {"NUMA `try_spawn` normal", test_try_spawn_success<make_numa_pool_t>},                                     //
+        {"NUMA `try_spawn` zero threads", test_try_spawn_zero<make_numa_pool_t>},                                  //
+        {"NUMA `broadcast` dispatch", test_broadcast<make_numa_pool_t>},                                           //
+        {"NUMA `caller_exclusive_k` calls", test_exclusivity<make_numa_pool_t>},                                   //
+        {"NUMA `for_n` for uncomfortable input size", test_uncomfortable_input_size<make_numa_pool_t>},            //
+        {"NUMA `for_n` static scheduling", test_for_n<make_numa_pool_t>},                                          //
+        {"NUMA `for_n_dynamic` dynamic scheduling", test_for_n_dynamic<make_numa_pool_t>},                         //
+        {"NUMA `for_n_dynamic` oversubscribed threads", test_oversubscribed_unbalanced_threads<make_numa_pool_t>}, //
+        {"NUMA `terminate` avoided", test_mixed_restart<false, make_numa_pool_t>},                                 //
+        {"NUMA `terminate` and re-spawn", test_mixed_restart<true, make_numa_pool_t>},                             //
+#endif // FU_ENABLE_NUMA
     };
 
     std::size_t const total_unit_tests = sizeof(unit_tests) / sizeof(unit_tests[0]);
