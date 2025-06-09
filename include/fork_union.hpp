@@ -293,7 +293,8 @@ class thread_pool {
      */
     caller_exclusivity_t caller_exclusivity() const noexcept { return exclusivity_; }
 
-    /** @brief Estimates the amount of memory managed by this pool handle and internal structures.
+    /**
+     *  @brief Estimates the amount of memory managed by this pool handle and internal structures.
      *  @note This API is @b not synchronized.
      */
     std::size_t memory_usage() const noexcept { return sizeof(thread_pool) + threads_count() * sizeof(std::thread); }
@@ -325,7 +326,7 @@ class thread_pool {
         std::thread *const workers = allocator_.allocate(worker_threads);
         if (!workers) return false; // ! Allocation failed
 
-        // Initialize the thread pool can fail for all kinds of reasons,
+        // Initializing the thread pool can fail for all kinds of reasons,
         // that the `std::thread` documentation describes as "implementation-defined".
         // https://en.cppreference.com/w/cpp/thread/thread/thread
         exclusivity_ = exclusivity;
@@ -412,6 +413,14 @@ class thread_pool {
         fork_state_ = std::addressof(function);
         fork_trampoline_ = &_call_as_lambda<function_type_>;
         threads_to_sync_.store(threads - use_caller_thread, std::memory_order_relaxed);
+
+        // We are most likely already "grinding", but in the unlikely case we are not,
+        // let's wake up from the "chilling" state with relaxed semantics. Assuming the sleeping
+        // logic for the workers also checks the epoch counter, no synchronization is needed and
+        // no immediate wake-up is required.
+        mood_t may_be_chilling = mood_t::chill_k;
+        mood_.compare_exchange_weak(may_be_chilling, mood_t::grind_k, std::memory_order_relaxed,
+                                    std::memory_order_relaxed);
         epoch_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current "main" thread
@@ -467,7 +476,7 @@ class thread_pool {
     /**
      *  @brief Transitions "workers" to a sleeping state, waiting for a wake-up call.
      *  @param[in] wake_up_periodicity_micros How often to check for new work in microseconds.
-     *  @note Can only be called between the tasks for a single thread. No synchronization is performed.
+     *  @note Can only be called @b between the tasks for a single thread. No synchronization is performed.
      *
      *  This function may be used in some batch-processing operations when we clearly understand
      *  that the next task won't be arriving for a while and power can be saved without major
@@ -479,6 +488,7 @@ class thread_pool {
     void sleep(std::size_t wake_up_periodicity_micros) noexcept {
         assert(wake_up_periodicity_micros > 0 && "Sleep length must be positive");
         sleep_length_micros_ = wake_up_periodicity_micros;
+        mood_.store(mood_t::chill_k, std::memory_order_release);
     }
 
   private:
@@ -517,8 +527,8 @@ class thread_pool {
                    (mood = mood_.load(std::memory_order_acquire)) == mood_t::grind_k)
                 micro_yield();
 
-            if (_FU_UNLIKELY(mood == mood_t::die_k)) { return; }
-            if (_FU_UNLIKELY(mood == mood_t::chill_k)) {
+            if (_FU_UNLIKELY(mood == mood_t::die_k)) return;
+            if (_FU_UNLIKELY(mood == mood_t::chill_k) && (new_epoch == last_epoch)) {
                 std::this_thread::sleep_for(std::chrono::microseconds(sleep_length_micros_));
                 continue;
             }
