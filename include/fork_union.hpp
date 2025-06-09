@@ -48,6 +48,8 @@
 #include <atomic>  // `std::atomic`
 #include <cstddef> // `std::max_align_t`
 #include <cassert> // `assert`
+#include <cstring> // `std::strlen`
+#include <utility> // `std::exchange`, `std::addressof`
 #include <new>     // `std::hardware_destructive_interference_size`
 
 #define FORK_UNION_VERSION_MAJOR 1
@@ -358,22 +360,29 @@ class thread_pool {
         // Initializing the thread pool can fail for all kinds of reasons,
         // that the `std::thread` documentation describes as "implementation-defined".
         // https://en.cppreference.com/w/cpp/thread/thread/thread
-        exclusivity_ = exclusivity;
+        caller_exclusivity_t const old_exclusivity = std::exchange(exclusivity_, exclusivity);
+        mood_.store(mood_t::grind_k, std::memory_order_release);
         for (thread_index_t i = 0; i < worker_threads; ++i) {
             try {
                 thread_index_t const i_with_caller = i + use_caller_thread;
                 new (&workers[i]) std::thread([this, i_with_caller] { _worker_loop(i_with_caller); });
             }
             catch (...) {
-                for (thread_index_t j = 0; j < i; ++j) workers[j].~thread();
+                mood_.store(mood_t::die_k, std::memory_order_release);
+                for (thread_index_t j = 0; j < i; ++j) {
+                    workers[j].join(); // ? Wait for the thread to exit
+                    workers[j].~thread();
+                }
                 allocator_.deallocate(workers, worker_threads);
-                return false; // ! Thread creation failed
+                exclusivity_ = old_exclusivity; // ? Restore the exclusivity
+                return false;                   // ! Thread creation failed
             }
         }
 
         // If all went well, we can store the thread-pool and start using it
         workers_ = workers;
         threads_count_ = threads;
+        assert(exclusivity_ == exclusivity); // ? This should already be the case
         return true;
     }
 
@@ -426,8 +435,9 @@ class thread_pool {
         // logic for the workers also checks the epoch counter, no synchronization is needed and
         // no immediate wake-up is required.
         mood_t may_be_chilling = mood_t::chill_k;
-        mood_.compare_exchange_weak(may_be_chilling, mood_t::grind_k, std::memory_order_relaxed,
-                                    std::memory_order_relaxed);
+        mood_.compare_exchange_weak(          //
+            may_be_chilling, mood_t::grind_k, //
+            std::memory_order_relaxed, std::memory_order_relaxed);
         epoch_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
 
         // Execute on the current "main" thread
