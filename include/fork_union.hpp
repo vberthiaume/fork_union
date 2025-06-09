@@ -173,6 +173,35 @@ struct standard_yield_t {
     inline void operator()() const noexcept { std::this_thread::yield(); }
 };
 
+/**
+ *  @brief A synchronization point that waits for all threads to finish the last broadcasted call.
+ *
+ *  You don't have to explicitly handle the return value and wait on it.
+ *  According to the  C++ standard, the destructor of the `broadcast_join_t` will be called
+ *  in the end of the `broadcast`-calling expression.
+ */
+template <typename thread_pool_type_, typename function_type_>
+struct broadcast_join {
+
+    using thread_pool_t = thread_pool_type_;
+    using function_t = function_type_;
+
+  private:
+    thread_pool_t &pool_;
+    function_t function_; // ? We need this to extend the lifetime of the lambda
+
+  public:
+    explicit broadcast_join(thread_pool_t &pool, function_t func) noexcept : pool_(pool), function_(func) {}
+
+    broadcast_join(broadcast_join &&) = default;
+    broadcast_join(broadcast_join const &) = delete;
+    broadcast_join &operator=(broadcast_join &&) = default;
+    broadcast_join &operator=(broadcast_join const &) = delete;
+    ~broadcast_join() noexcept { wait(); }
+    void wait() const noexcept { pool_.unsafe_join(); }
+    function_t const &function() const noexcept { return function_; }
+};
+
 #pragma region - Thread Pool
 
 /**
@@ -349,29 +378,6 @@ class thread_pool {
     }
 
     /**
-     *  @brief A synchronization point that waits for all threads to finish the last broadcasted call.
-     *
-     *  You don't have to explicitly handle the return value and wait on it.
-     *  According to the  C++ standard, the destructor of the `broadcast_join_t` will be called
-     *  in the end of the `broadcast`-calling expression.
-     */
-    class broadcast_join_t {
-        std::atomic<thread_index_t> &threads_to_sync_;
-
-      public:
-        explicit broadcast_join_t(std::atomic<thread_index_t> &sync) noexcept : threads_to_sync_(sync) {}
-        broadcast_join_t(broadcast_join_t &&) = default;
-        broadcast_join_t(broadcast_join_t const &) = delete;
-        broadcast_join_t &operator=(broadcast_join_t &&) = default;
-        broadcast_join_t &operator=(broadcast_join_t const &) = delete;
-        ~broadcast_join_t() noexcept { wait(); }
-        void wait() const noexcept {
-            micro_yield_t micro_yield;
-            while (threads_to_sync_.load(std::memory_order_acquire)) micro_yield();
-        }
-    };
-
-    /**
      *  @brief Executes a @p function in parallel on all threads.
      *  @param[in] function The callback, receiving the thread index as an argument.
      *  @return A `broadcast_join_t` synchronization point that waits in the destructor.
@@ -379,9 +385,10 @@ class thread_pool {
      *  @sa For advanced resource management, consider `unsafe_broadcast` and `unsafe_join`.
      */
     template <typename function_type_>
-    broadcast_join_t broadcast(function_type_ const &function) noexcept {
-        unsafe_broadcast(function);
-        return unsafe_join();
+    broadcast_join<thread_pool, function_type_> broadcast(function_type_ &&function) noexcept {
+        broadcast_join<thread_pool, function_type_> result {*this, std::forward<function_type_>(function)};
+        unsafe_broadcast(result.function());
+        return result;
     }
 
     /**
@@ -428,7 +435,10 @@ class thread_pool {
     }
 
     /** @brief Blocks the calling thread until the currently broadcasted task finishes. */
-    broadcast_join_t unsafe_join() noexcept { return broadcast_join_t(threads_to_sync_); }
+    void unsafe_join() noexcept {
+        micro_yield_t micro_yield;
+        while (threads_to_sync_.load(std::memory_order_acquire)) micro_yield();
+    }
 
     /**
      *  @brief Stops all threads and deallocates the thread-pool after the last call finishes.
@@ -571,7 +581,7 @@ concept is_unsafe_pool =   //
         { p.unsafe_broadcast(broadcasted_noop_t {}) } -> std::same_as<void>;
     } && //
     requires(pool_type_ &p) {
-        { p.unsafe_join() } -> std::same_as<typename pool_type_::broadcast_join_t>;
+        { p.unsafe_join() } -> std::same_as<void>;
     };
 
 #endif
