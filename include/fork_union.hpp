@@ -570,6 +570,66 @@ concept is_unsafe_pool =   //
 
 #pragma region - Hardware Friendly Yield
 
+#if defined(__GNUC__) || defined(__clang__) // We need inline assembly support
+
+#if defined(__aarch64__)
+
+struct aarch64_yield_t {
+    inline void operator()() const noexcept { __asm__ __volatile__("yield"); }
+};
+
+/**
+ *  @brief On AArch64 uses the `WFET` instruction to "Wait For Event (Timed)".
+ *
+ *  Places the core into light sleep mode, waiting for an event to wake it up,
+ *  or the timeout to expire.
+ */
+struct aarch64_wfet_t {
+    inline void operator()() const noexcept {}
+};
+#endif
+
+#if defined(__x86_64__) || defined(__i386)
+struct x86_yield_t {
+    inline void operator()() const noexcept { __asm__ __volatile__("pause"); }
+};
+
+#pragma GCC push_options
+#pragma GCC target("waitpkg")
+#pragma clang attribute push(__waitpkg__)
+
+/**
+ *  @brief On x86 uses the `TPAUSE` instruction to yield for 1 microsecond if `WAITPKG` is supported.
+ *
+ *  There are several newer ways to yield on x86, but they may require different privileges:
+ *  - `MONITOR` and `MWAIT` in SSE - used for power management, require RING 0 privilege.
+ *  - `UMONITOR` and `UMWAIT` in `WAITPKG` - are the user-space variants.
+ *  - `MWAITX` in `MONITORX` ISA on AMD - used for power management, requires RING 0 privilege.
+ *  - `TPAUSE` in `WAITPKG` - time-based pause instruction, available in RING 3.
+ */
+struct x86_tpause_1us_t {
+    inline void operator()() const noexcept {
+        __asm__ volatile( //
+            "xor %%eax,%%eax\n\t"
+            "mov $1000, %%ebx\n\t"
+            ".byte 0x66,0x0F,0xAE,0xFA" ::
+                : "eax", "ebx", "memory");
+    }
+};
+
+#pragma GCC pop_options
+#pragma clang attribute pop
+
+#endif
+
+#if defined(__riscv)
+struct riscv_yield_t {
+    inline void operator()() const noexcept { __asm__ __volatile__("pause"); }
+};
+#endif
+
+#endif
+
 #pragma endregion - Hardware Friendly Yield
 
 #pragma region - NUMA Pools
