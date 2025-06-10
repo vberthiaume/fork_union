@@ -61,7 +61,7 @@
 #endif
 
 #if !defined(FU_ENABLE_NUMA)
-#if defined(__linux__) && defined(__GLIBC__)
+#if defined(__linux__) && defined(__GLIBC__) && __GLIBC_PREREQ(2, 30)
 #define FU_ENABLE_NUMA 1
 #else
 #define FU_ENABLE_NUMA 0
@@ -75,6 +75,7 @@
 #if FU_ENABLE_NUMA
 #include <numa.h>    // `numa_available`, `numa_node_of_cpu`, `numa_alloc_onnode`
 #include <pthread.h> // `pthread_getaffinity_np`
+#include <unistd.h>  // `gettid`
 #endif
 
 /**
@@ -335,7 +336,7 @@ class thread_pool {
 
     /**
      *  @brief Creates a thread-pool with the given number of threads.
-     *  @param[in] threads The number of threads to be used. Should be larger than one.
+     *  @param[in] threads The number of threads to be used.
      *  @param[in] exclusivity Should we count the calling thread as one of the threads?
      *  @retval false if the number of threads is zero or the "workers" allocation failed.
      *  @retval true if the thread-pool was created successfully, started, and is ready to use.
@@ -357,11 +358,21 @@ class thread_pool {
         std::thread *const workers = allocator_.allocate(worker_threads);
         if (!workers) return false; // ! Allocation failed
 
+        // Before we start the threads, make sure we set some of the shared
+        // state variables that will be used in the `_worker_loop` function.
+        workers_ = workers;
+        threads_count_ = threads;
+        exclusivity_ = exclusivity;
+        mood_.store(mood_t::grind_k, std::memory_order_release);
+        auto reset_on_failure = [&]() noexcept {
+            allocator_.deallocate(workers, threads);
+            workers_ = nullptr;
+            threads_count_ = 0;
+        };
+
         // Initializing the thread pool can fail for all kinds of reasons,
         // that the `std::thread` documentation describes as "implementation-defined".
         // https://en.cppreference.com/w/cpp/thread/thread/thread
-        caller_exclusivity_t const old_exclusivity = std::exchange(exclusivity_, exclusivity);
-        mood_.store(mood_t::grind_k, std::memory_order_release);
         for (thread_index_t i = 0; i < worker_threads; ++i) {
             try {
                 thread_index_t const i_with_caller = i + use_caller_thread;
@@ -373,16 +384,11 @@ class thread_pool {
                     workers[j].join(); // ? Wait for the thread to exit
                     workers[j].~thread();
                 }
-                allocator_.deallocate(workers, worker_threads);
-                exclusivity_ = old_exclusivity; // ? Restore the exclusivity
-                return false;                   // ! Thread creation failed
+                reset_on_failure();
+                return false;
             }
         }
 
-        // If all went well, we can store the thread-pool and start using it
-        workers_ = workers;
-        threads_count_ = threads;
-        assert(exclusivity_ == exclusivity); // ? This should already be the case
         return true;
     }
 
@@ -395,9 +401,9 @@ class thread_pool {
      */
     template <typename function_type_>
     broadcast_join<thread_pool, function_type_> broadcast(function_type_ &&function) noexcept {
-        broadcast_join<thread_pool, function_type_> result {*this, std::forward<function_type_>(function)};
-        unsafe_broadcast(result.function());
-        return result;
+        broadcast_join<thread_pool, function_type_> joiner {*this, std::forward<function_type_>(function)};
+        unsafe_broadcast(joiner.function());
+        return joiner;
     }
 
     /**
@@ -473,10 +479,10 @@ class thread_pool {
         }
         assert(threads_to_sync_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
 
-        // Stop all threads and wait for them to finish
-        _reset_fork();
+        // Notify all worker threads...
         mood_.store(mood_t::die_k, std::memory_order_release);
 
+        // ... and wait for them to finish
         thread_index_t const worker_threads = threads_count_ - use_caller_thread;
         for (thread_index_t i = 0; i != worker_threads; ++i) {
             workers_[i].join();    // ? Wait for the thread to finish
@@ -489,6 +495,7 @@ class thread_pool {
         // Prepare for future spawns
         threads_count_ = 0;
         workers_ = nullptr;
+        _reset_fork();
         mood_.store(mood_t::grind_k, std::memory_order_relaxed);
         epoch_.store(0, std::memory_order_relaxed);
     }
@@ -547,7 +554,7 @@ class thread_pool {
                    (mood = mood_.load(std::memory_order_acquire)) == mood_t::grind_k)
                 micro_yield();
 
-            if (_FU_UNLIKELY(mood == mood_t::die_k)) return;
+            if (_FU_UNLIKELY(mood == mood_t::die_k)) break;
             if (_FU_UNLIKELY(mood == mood_t::chill_k) && (new_epoch == last_epoch)) {
                 std::this_thread::sleep_for(std::chrono::microseconds(sleep_length_micros_));
                 continue;
@@ -668,6 +675,41 @@ struct riscv_yield_t {
 using numa_core_id_t = int; // ? A.k.a. CPU core ID, in [0, threads_count)
 using numa_node_id_t = int; // ? A.k.a. NUMA node ID, in [0, numa_max_node())
 
+enum numa_pin_granularity_t {
+    numa_pin_to_node_k,
+    numa_pin_to_core_k,
+};
+
+/**
+ *  @brief Describes a NUMA node, containing its ID, memory size, and core IDs.
+ *  @sa Views different slices of the `numa_topology` structure.
+ */
+struct numa_node_t {
+    numa_node_id_t node_id {-1};                   // ? Unique NUMA node ID, in [0, numa_max_node())
+    std::size_t memory_size {0};                   // ? RAM volume in bytes
+    numa_core_id_t const *first_core_id {nullptr}; // ? Pointer to the first core ID in the `core_ids` array
+    std::size_t core_count {0};                    // ? Number of items in `core_ids` array
+};
+
+/**
+ *  @brief Used inside `numa_thread_pool` to describe a pinned thread.
+ *
+ *  On Linux, we can advise the scheduler on the importance of certain execution threads.
+ *  For that we need to know the thread IDs - `pid_t`, which is not the same as `pthread_t`,
+ *  and not a process ID, but a thread ID... counter-intuitive, I know.
+ *  @see https://man7.org/linux/man-pages/man2/gettid.2.html
+ *
+ *  That `pid_t` can only be retrieved from inside the thread via `gettid` system call,
+ *  so we need some shared memory to make those IDs visible to other threads. Moreover,
+ *  we need to safeguard the reads/writes with atomics to avoid race conditions.
+ *  @see https://stackoverflow.com/a/558815
+ */
+struct alignas(default_alignment_k) numa_pthread_t {
+    std::atomic<pthread_t> handle;
+    std::atomic<pid_t> id;
+    numa_core_id_t core_id;
+};
+
 /**
  *  @brief NUMA topology descriptor: describing memory pools and core counts next to them.
  *
@@ -678,31 +720,24 @@ using numa_node_id_t = int; // ? A.k.a. NUMA node ID, in [0, numa_max_node())
 template <typename allocator_type_ = std::allocator<char>>
 struct numa_topology {
 
-    struct numa_node_t {
-        numa_node_id_t node_id {-1};                   // ? Unique NUMA node ID, in [0, numa_max_node())
-        std::size_t memory_size {0};                   // ? RAM volume in bytes
-        numa_core_id_t const *first_core_id {nullptr}; // ? Pointer to the first core ID in the `core_ids` array
-        std::size_t core_count {0};                    // ? Number of items in `core_ids` array
-    };
-
     using allocator_t = allocator_type_;
     using cores_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<int>;
     using nodes_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<numa_node_t>;
 
   private:
     numa_node_t *nodes_ {nullptr};
-    numa_core_id_t *grouped_core_ids_ {nullptr}; // ? Unsigned integers in [0, threads_count), grouped by NUMA node
-    std::size_t nodes_count_ {0};                // ? Number of NUMA nodes
-    std::size_t cores_count_ {0};                // ? Total number of cores in all nodes
+    numa_core_id_t *node_core_ids_ {nullptr}; // ? Unsigned integers in [0, threads_count), grouped by NUMA node
+    std::size_t nodes_count_ {0};             // ? Number of NUMA nodes
+    std::size_t cores_count_ {0};             // ? Total number of cores in all nodes
     allocator_t allocator_ {};
 
   public:
     constexpr numa_topology() noexcept = default;
     numa_topology(numa_topology &&o) noexcept
-        : allocator_(std::move(o.allocator_)), nodes_(o.nodes_), grouped_core_ids_(o.grouped_core_ids_),
+        : allocator_(std::move(o.allocator_)), nodes_(o.nodes_), node_core_ids_(o.node_core_ids_),
           nodes_count_(o.nodes_count_), cores_count_(o.cores_count_) {
         o.nodes_ = nullptr;
-        o.grouped_core_ids_ = nullptr;
+        o.node_core_ids_ = nullptr;
         o.nodes_count_ = 0;
         o.cores_count_ = 0;
     }
@@ -717,11 +752,11 @@ struct numa_topology {
         cores_allocator_t cores_alloc {allocator_};
         nodes_allocator_t nodes_alloc {allocator_};
 
-        if (grouped_core_ids_) cores_alloc.deallocate(grouped_core_ids_, cores_count_);
+        if (node_core_ids_) cores_alloc.deallocate(node_core_ids_, cores_count_);
         if (nodes_) nodes_alloc.deallocate(nodes_, nodes_count_);
 
         nodes_ = nullptr;
-        grouped_core_ids_ = nullptr;
+        node_core_ids_ = nullptr;
         nodes_count_ = cores_count_ = 0;
     }
 
@@ -740,7 +775,7 @@ struct numa_topology {
     bool try_harvest() noexcept {
         struct bitmask *numa_mask = nullptr;
         numa_node_t *nodes_ptr = nullptr;
-        numa_core_id_t *cores_ptr = nullptr;
+        numa_core_id_t *core_ids_ptr = nullptr;
         numa_node_id_t max_numa_node_id = -1;
 
         // Allocators must be visible to the cleanup path
@@ -759,39 +794,43 @@ struct numa_topology {
         max_numa_node_id = numa_max_node();
         for (numa_node_id_t node_id = 0; node_id <= max_numa_node_id; ++node_id) {
             long long dummy;
-            if (numa_node_size64(node_id, &dummy) < 0) continue;     // ! Offline node
+            if (numa_node_size64(node_id, &dummy) < 0) continue; // ! Offline node
+            numa_bitmask_clearall(numa_mask);
             if (numa_node_to_cpus(node_id, numa_mask) < 0) continue; // ! Invalid CPU map
+            std::size_t const node_cores = static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
+            assert(node_cores > 0 && "Node must have at least one core");
             fetched_nodes += 1;
-            fetched_cores += static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
+            fetched_cores += node_cores;
         }
         if (fetched_nodes == 0) goto failed_harvest; // ! Zero nodes is not a valid state
 
         // Second pass – allocate
         nodes_ptr = nodes_alloc.allocate(fetched_nodes);
-        cores_ptr = cores_alloc.allocate(fetched_cores);
-        if (!nodes_ptr || !cores_ptr) goto failed_harvest; // ! Allocation failed
+        core_ids_ptr = cores_alloc.allocate(fetched_cores);
+        if (!nodes_ptr || !core_ids_ptr) goto failed_harvest; // ! Allocation failed
 
         // Populate
         for (numa_node_id_t node_id = 0, core_id = 0; node_id <= max_numa_node_id; ++node_id) {
             long long memory_size;
             if (numa_node_size64(node_id, &memory_size) < 0) continue;
+            numa_bitmask_clearall(numa_mask);
             if (numa_node_to_cpus(node_id, numa_mask) < 0) continue;
 
             numa_node_t &node = nodes_ptr[node_id];
             node.node_id = node_id;
             node.memory_size = static_cast<std::size_t>(memory_size);
-            node.first_core_id = cores_ptr + core_id;
+            node.first_core_id = core_ids_ptr + core_id;
             node.core_count = static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
 
-            // Most likely, this will fill `cores_ptr` with `std::iota`-like values
+            // Most likely, this will fill `core_ids_ptr` with `std::iota`-like values
             for (std::size_t bit_offset = 0; bit_offset < numa_mask->size; ++bit_offset)
                 if (numa_bitmask_isbitset(numa_mask, bit_offset))
-                    cores_ptr[core_id++] = static_cast<numa_core_id_t>(bit_offset);
+                    core_ids_ptr[core_id++] = static_cast<numa_core_id_t>(bit_offset);
         }
 
         // Commit
         nodes_ = nodes_ptr;
-        grouped_core_ids_ = cores_ptr;
+        node_core_ids_ = core_ids_ptr;
         nodes_count_ = fetched_nodes;
         cores_count_ = fetched_cores;
 
@@ -800,19 +839,23 @@ struct numa_topology {
 
     failed_harvest:
         if (nodes_ptr) nodes_alloc.deallocate(nodes_ptr, fetched_nodes);
-        if (cores_ptr) cores_alloc.deallocate(cores_ptr, fetched_cores);
+        if (core_ids_ptr) cores_alloc.deallocate(core_ids_ptr, fetched_cores);
         if (numa_mask) numa_free_cpumask(numa_mask);
         return false;
     }
 };
 
+using numa_topology_t = numa_topology<>;
+
 /** @brief STL-compatible allocator that puts memory on a fixed NUMA node. */
-template <typename value_type_>
+template <typename value_type_ = char>
 struct numa_allocator {
     using value_type = value_type_;
     numa_node_id_t node_id {-1};
 
-    explicit numa_allocator(numa_node_id_t id = -1) noexcept : node_id(id) {}
+    constexpr numa_allocator() noexcept = default;
+    explicit constexpr numa_allocator(numa_node_id_t id) noexcept : node_id(id) {}
+
     template <typename other_type_>
     constexpr numa_allocator(numa_allocator<other_type_> const &o) noexcept : node_id(o.node_id) {}
 
@@ -832,24 +875,623 @@ struct numa_allocator {
     }
 };
 
+using numa_allocator_t = numa_allocator<>;
+
 /**
  *  @brief A thread-pool addressing all of the threads on a certain NUMA node.
+ *
+ *  Differs from the `thread_pool` template in the following ways:
+ *  - constructor API: receives a name for the threads.
+ *  - implementation & API of `try_spawn`: uses POSIX APIs to allocate, name, & pin threads.
+ *  - worker loop: using Linux-specific napping mechanism to reduce power consumption.
+ *  - implementation `sleep`: informing the scheduler to move the thread to IDLE state.
+ *  - availability of `terminate`: which can be called mid-air to shred the pool.
+ *
+ *  When not to use this thread-pool?
+ *  - don't use outside of Linux or in UMA (Uniform Memory Access) systems.
+ *  - don't use if you just need to pin everything to a single NUMA node,
+ *    for that: `numactl --cpunodebind=2 --membind=2 your_program`
+ *
+ *  How to best leverage this thread-pool?
+ *  - use in conjunction with @b `numa_allocator` to pin memory to the same NUMA node.
+ *  - make sure the Linux kernel is built with @b `CONFIG_SCHED_IDLE` support.
  */
-template <                                                  //
-    typename allocator_type_ = numa_allocator<std::thread>, //
-    typename micro_yield_type_ = standard_yield_t,          //
-    typename index_type_ = std::size_t,                     //
-    std::size_t alignment_ = default_alignment_k            //
-    >
-struct numa_thread_pool {};
+template <typename micro_yield_type_ = standard_yield_t, std::size_t alignment_ = default_alignment_k>
+struct numa_thread_pool {
 
-template <                                                  //
-    typename allocator_type_ = numa_allocator<std::thread>, //
-    typename micro_yield_type_ = standard_yield_t,          //
-    typename index_type_ = std::size_t,                     //
-    std::size_t alignment_ = default_alignment_k            //
-    >
-struct numa_thread_pools {};
+  public:
+    using allocator_t = numa_allocator_t;
+    using micro_yield_t = micro_yield_type_;
+    static_assert(std::is_nothrow_invocable_r<void, micro_yield_t>::value,
+                  "Yield must be callable w/out arguments & return void");
+    static constexpr std::size_t alignment_k = alignment_;
+    static_assert(alignment_k > 0 && (alignment_k & (alignment_k - 1)) == 0, "Alignment must be a power of 2");
+
+    using index_t = std::size_t;
+    static_assert(std::is_unsigned<index_t>::value, "Index type must be an unsigned integer");
+    using epoch_index_t = index_t;  // ? A.k.a. number of previous API calls in [0, UINT_MAX)
+    using thread_index_t = index_t; // ? A.k.a. "core index" or "thread ID" in [0, threads_count)
+
+    using punned_fork_context_t = void const *;                           // ? Pointer to the on-stack lambda
+    using trampoline_t = void (*)(punned_fork_context_t, thread_index_t); // ? Wraps lambda's `operator()`
+
+  private:
+    using allocator_traits_t = std::allocator_traits<allocator_t>;
+    using numa_pthread_allocator_t = typename allocator_traits_t::template rebind_alloc<numa_pthread_t>;
+
+    // Thread-pool-specific variables:
+    allocator_t allocator_ {};
+
+    /**
+     *  Differs from STL `workers_` in base in type and size, as it may contain the `pthread_self`
+     *  at the first position. If the @b `numa_pin_to_core_k` granularity is used, the `numa_pthread_t::core_id`
+     *  will be set to the individual core IDs.
+     */
+    numa_pthread_t *pthreads_ {nullptr};
+    thread_index_t pthreads_count_ {0};
+
+    caller_exclusivity_t exclusivity_ {caller_inclusive_k}; // ? Whether the caller thread is included in the count
+    std::size_t sleep_length_micros_ {0}; // ? How long to sleep in microseconds when waiting for tasks
+
+    using char16_name_t = char[16];    // ? Fixed-size thread name buffer, for POSIX thread naming
+    char16_name_t name_ {};            // ? Thread name buffer, for POSIX thread naming
+    numa_node_id_t numa_node_id_ {-1}; // ? Unique NUMA node ID, in [0, numa_max_node())
+    numa_pin_granularity_t pin_granularity_ {numa_pin_to_core_k};
+
+    alignas(alignment_) std::atomic<mood_t> mood_ {mood_t::grind_k};
+
+    // Task-specific variables:
+    punned_fork_context_t fork_state_ {nullptr}; // ? Pointer to the users lambda
+    trampoline_t fork_trampoline_ {nullptr};     // ? Calls the lambda
+    alignas(alignment_) std::atomic<thread_index_t> threads_to_sync_ {0};
+    alignas(alignment_) std::atomic<epoch_index_t> epoch_ {0};
+
+  public:
+    numa_thread_pool(numa_thread_pool &&) = delete;
+    numa_thread_pool(numa_thread_pool const &) = delete;
+    numa_thread_pool &operator=(numa_thread_pool &&) = delete;
+    numa_thread_pool &operator=(numa_thread_pool const &) = delete;
+
+    explicit numa_thread_pool(char const *name = "fork_union") noexcept {
+        assert(name && "Thread name must not be null");
+        if (std::strlen(name_) == 0) { std::strncpy(name_, "fork_union", sizeof(name_) - 1); } // ? Default name
+        else { std::strncpy(name_, name, sizeof(name_) - 1), name_[sizeof(name_) - 1] = '\0'; }
+    }
+
+    ~numa_thread_pool() noexcept { terminate(); }
+
+    /**
+     *  @brief Returns the number of threads in the thread-pool, including the main thread.
+     *  @retval 0 if the thread-pool is not initialized, 1 if only the main thread is used.
+     *  @note This API is @b not synchronized.
+     */
+    thread_index_t threads_count() const noexcept { return pthreads_count_; }
+
+    /**
+     *  @brief Reports if the current calling thread will be used for broadcasts.
+     *  @note This API is @b not synchronized.
+     */
+    caller_exclusivity_t caller_exclusivity() const noexcept { return exclusivity_; }
+
+    /**
+     *  @brief Estimates the amount of memory managed by this pool handle and internal structures.
+     *  @note This API is @b not synchronized.
+     */
+    std::size_t memory_usage() const noexcept {
+        return sizeof(numa_thread_pool) + threads_count() * sizeof(numa_pthread_t);
+    }
+
+    /** @brief Checks if the thread-pool's core synchronization points are lock-free. */
+    bool is_lock_free() const noexcept { return mood_.is_lock_free() && threads_to_sync_.is_lock_free(); }
+
+    /**
+     *  @brief Creates a thread-pool addressing all cores on the given NUMA @p node.
+     *  @param[in] node Describes the NUMA node to use, with its ID, memory size, and core IDs.
+     *  @param[in] exclusivity Should we count the calling thread as one of the threads?
+     *  @retval false if the number of threads is zero or if spawning has failed.
+     *  @retval true if the thread-pool was created successfully, started, and is ready to use.
+     *  @note This is the de-facto @b constructor - you only call it again after `terminate`.
+     *  @sa Other overloads of `try_spawn` that allow to specify the number of threads.
+     */
+    bool try_spawn(numa_node_t const node, caller_exclusivity_t const exclusivity = caller_inclusive_k) noexcept {
+        return try_spawn(node, node.core_count, exclusivity);
+    }
+
+    /**
+     *  @brief Creates a thread-pool with the given number of @p threads on the given NUMA @p node.
+     *  @param[in] node Describes the NUMA node to use, with its ID, memory size, and core IDs.
+     *  @param[in] threads The number of threads to be used.
+     *  @param[in] exclusivity Should we count the calling thread as one of the threads?
+     *  @param[in] pin_granularity How to pin the threads to the NUMA node?
+     *  @retval false if the number of threads is zero or if spawning has failed.
+     *  @retval true if the thread-pool was created successfully, started, and is ready to use.
+     *  @note This is the de-facto @b constructor - you only call it again after `terminate`.
+     *
+     *  @section Over- and Under-subscribing Cores and Pinning
+     *
+     *  We may accept @p threads different from the @p node.core_count, which allows us to:
+     *  - over-subscribe the cores, i.e. use more threads than cores available on the NUMA node.
+     *  - under-subscribe the cores, i.e. use fewer threads than cores available on the NUMA node.
+     *
+     *  If you only have one thread-pool active at any part of your application, that's meaningless.
+     *  You'd be better off using exactly the number of cores available on the NUMA node and pinning
+     *  them to individual cores with @b `numa_pin_to_core_k` granularity.
+     */
+    bool try_spawn(numa_node_t const node, thread_index_t const threads,
+                   caller_exclusivity_t const exclusivity = caller_inclusive_k,
+                   numa_pin_granularity_t const pin_granularity = numa_pin_to_core_k) noexcept {
+
+        if (threads == 0) return false;         // ! Can't have zero threads working on something
+        if (pthreads_count_ != 0) return false; // ! Already initialized
+
+        // Allocate the thread pool of `numa_pthread_t` objects
+        allocator_ = numa_allocator_t {node.node_id};
+        numa_pthread_allocator_t pthread_allocator {allocator_};
+        numa_pthread_t *const pthreads = pthread_allocator.allocate(threads);
+        if (!pthreads) {
+            pthread_allocator.deallocate(pthreads, threads);
+            return false; // ! Allocation failed
+        }
+
+        // Allocate the `cpu_set_t` structure, assuming we may be on a machine
+        // with a ridiculously large number of cores.
+        std::size_t const max_possible_cores = std::thread::hardware_concurrency();
+        cpu_set_t *cpu_set_ptr = CPU_ALLOC(max_possible_cores);
+
+        // Before we start the threads, make sure we set some of the shared
+        // state variables that will be used in the `_posix_worker_loop` function.
+        pthreads_ = pthreads;
+        pthreads_count_ = threads;
+        exclusivity_ = exclusivity;
+        numa_node_id_ = node.node_id;
+        pin_granularity_ = pin_granularity;
+        auto reset_on_failure = [&]() noexcept {
+            pthread_allocator.deallocate(pthreads, threads);
+            pthreads_ = nullptr;
+            pthreads_count_ = 0;
+            numa_node_id_ = -1;
+            pin_granularity_ = numa_pin_to_core_k;
+        };
+
+        // Include the main thread into the list of handles
+        bool const use_caller_thread = exclusivity == caller_inclusive_k;
+        if (use_caller_thread) {
+            pthreads_[0].handle.store(::pthread_self(), std::memory_order_release);
+            pthreads_[0].id.store(::gettid(), std::memory_order_release);
+        }
+
+        // The startup sequence for the POSIX threads differs from the `thread_pool`,
+        // where at start up there is a race condition to read the `pthreads_`.
+        // So we mark the threads as "chilling" until the
+        mood_.store(mood_t::chill_k, std::memory_order_release);
+
+        // Initializing the thread pool can fail for all kinds of reasons, like:
+        // - `EAGAIN` if we reach the `RLIMIT_NPROC` soft resource limit.
+        // - `EINVAL` if an invalid attribute was specified.
+        // - `EPERM` if we don't have the right permissions.
+        for (thread_index_t i = use_caller_thread; i < threads; ++i) {
+
+            pthread_t pthread_handle;
+            int creation_result = ::pthread_create(&pthread_handle, NULL, &_posix_worker_loop, this);
+            pthreads_[i].handle.store(pthread_handle, std::memory_order_relaxed);
+            pthreads_[i].id.store(-1, std::memory_order_relaxed);
+            pthreads_[i].core_id = -1; // ? Not pinned yet
+
+            if (creation_result != 0) {
+                mood_.store(mood_t::die_k, std::memory_order_release);
+                for (thread_index_t j = use_caller_thread; j < i; ++j) {
+                    pthread_t pthread_handle = pthreads_[j].handle.load(std::memory_order_relaxed);
+                    int cancel_result = ::pthread_cancel(pthread_handle);
+                    assert(cancel_result == 0 && "Failed to cancel a thread");
+                }
+                reset_on_failure();
+                CPU_FREE(cpu_set_ptr);
+                return false; // ! Thread creation failed
+            }
+        }
+
+        // Name all of the threads
+        char16_name_t name;
+        for (thread_index_t i = 0; i < pthreads_count_; ++i) {
+            fill_thread_name(name, name_, static_cast<std::size_t>(node.first_core_id[i]), max_possible_cores);
+            pthread_t pthread_handle = pthreads_[i].handle.load(std::memory_order_relaxed);
+            int naming_result = ::pthread_setname_np(pthread_handle, name);
+            assert(naming_result == 0 && "Failed to name a thread");
+        }
+
+        // Pin all of the threads
+        std::size_t const cpu_set_size = CPU_ALLOC_SIZE(max_possible_cores);
+        if (pin_granularity == numa_pin_to_core_k) {
+            // Configure a mask for each thread, pinning it to a specific core
+            for (thread_index_t i = 0; i < pthreads_count_; ++i) {
+                // Assign to a core in a round-robin fashion
+                numa_core_id_t cpu = node.first_core_id[i % node.core_count];
+                assert(cpu >= 0 && "Invalid CPU core ID");
+                CPU_ZERO(cpu_set_ptr);
+                CPU_SET(cpu, cpu_set_ptr);
+
+                // Assign the mask to the thread
+                pthread_t pthread_handle = pthreads_[i].handle.load(std::memory_order_relaxed);
+                int pin_result = ::pthread_setaffinity_np(pthread_handle, cpu_set_size, cpu_set_ptr);
+                assert(pin_result == 0 && "Failed to pin a thread to a NUMA node");
+                pthreads_[i].core_id = cpu;
+            }
+        }
+        else {
+            // Configure one mask that will be shared by all threads
+            CPU_ZERO(cpu_set_ptr);
+            for (std::size_t i = 0; i < node.core_count; ++i) {
+                numa_core_id_t cpu = node.first_core_id[i];
+                assert(cpu >= 0 && "Invalid CPU core ID");
+                CPU_SET(cpu, cpu_set_ptr);
+            }
+            assert(static_cast<std::size_t>(CPU_COUNT(cpu_set_ptr)) == node.core_count &&
+                   "The CPU set must match the number of cores in the NUMA node");
+
+            // Assign the same mask to all threads
+            for (thread_index_t i = 0; i < pthreads_count_; ++i) {
+                pthread_t pthread_handle = pthreads_[i].handle.load(std::memory_order_relaxed);
+                int pin_result = ::pthread_setaffinity_np(pthread_handle, cpu_set_size, cpu_set_ptr);
+                assert(pin_result == 0 && "Failed to pin a thread to a NUMA node");
+            }
+        }
+
+        // If all went well, we can store the thread-pool and start using it
+        CPU_FREE(cpu_set_ptr); // ? Clean up the CPU set
+        mood_.store(mood_t::grind_k, std::memory_order_release);
+        return true;
+    }
+
+    /**
+     *  @brief Executes a @p function in parallel on all threads.
+     *  @param[in] function The callback, receiving the thread index as an argument.
+     *  @return A `broadcast_join_t` synchronization point that waits in the destructor.
+     *  @note Even in the `caller_exclusive_k` mode, can be called from just one thread!
+     *  @sa For advanced resource management, consider `unsafe_broadcast` and `unsafe_join`.
+     */
+    template <typename function_type_>
+    broadcast_join<numa_thread_pool, function_type_> broadcast(function_type_ &&function) noexcept {
+        broadcast_join<numa_thread_pool, function_type_> joiner {*this, std::forward<function_type_>(function)};
+        unsafe_broadcast(joiner.function());
+        return joiner;
+    }
+
+    /**
+     *  @brief Executes a @p function in parallel on all threads, not waiting for the result.
+     *  @param[in] function The callback, receiving the thread index as an argument.
+     *  @sa Use in conjunction with `unsafe_join`.
+     */
+    template <typename function_type_>
+    void unsafe_broadcast(function_type_ const &function) noexcept {
+
+        thread_index_t const threads = threads_count();
+        assert(threads != 0 && "Thread pool not initialized");
+        caller_exclusivity_t const exclusivity = caller_exclusivity();
+        bool const use_caller_thread = exclusivity == caller_inclusive_k;
+        if (threads == 1 && use_caller_thread) return function(static_cast<thread_index_t>(0));
+
+        // Optional check: even in exclusive mode, only one thread can call this function.
+        assert((use_caller_thread || threads_to_sync_.load(std::memory_order_acquire) == 0) &&
+               "The broadcast function can be called only from one thread at a time");
+
+#if _FU_DETECT_CPP_17
+        // ? Exception handling and aggregating return values drastically increases code complexity
+        // ? we live to the higher-level algorithms.
+        static_assert(std::is_nothrow_invocable_r<void, function_type_, thread_index_t>::value,
+                      "The callback must be invocable with a `thread_index_t` argument");
+#endif
+
+        // Configure "fork" details
+        fork_state_ = std::addressof(function);
+        fork_trampoline_ = &_call_as_lambda<function_type_>;
+        threads_to_sync_.store(threads - use_caller_thread, std::memory_order_relaxed);
+
+        // We are most likely already "grinding", but in the unlikely case we are not,
+        // let's wake up from the "chilling" state with relaxed semantics. Assuming the sleeping
+        // logic for the workers also checks the epoch counter, no synchronization is needed and
+        // no immediate wake-up is required.
+        mood_t may_be_chilling = mood_t::chill_k;
+        bool const was_chilling = mood_.compare_exchange_weak( //
+            may_be_chilling, mood_t::grind_k,                  //
+            std::memory_order_relaxed, std::memory_order_relaxed);
+        epoch_.fetch_add(1, std::memory_order_release); // ? Wake up sleepers
+
+        // If the workers were indeed "chilling", we can inform the scheduler to wake them up.
+        if (was_chilling) {
+            for (std::size_t i = use_caller_thread; i < pthreads_count_; ++i) {
+                pid_t const pthread_id = pthreads_[i].id.load(std::memory_order_acquire);
+                if (pthread_id < 0) continue; // ? Not set yet
+                sched_param param {};
+                ::sched_setscheduler(pthread_id, SCHED_FIFO | SCHED_RR, &param);
+            }
+        }
+
+        // Execute on the current "main" thread
+        if (use_caller_thread) function(static_cast<thread_index_t>(0));
+    }
+
+    /** @brief Blocks the calling thread until the currently broadcasted task finishes. */
+    void unsafe_join() noexcept {
+        micro_yield_t micro_yield;
+        while (threads_to_sync_.load(std::memory_order_acquire)) micro_yield();
+    }
+
+    /**
+     *  @brief Stops all threads and deallocates the thread-pool after the last call finishes.
+     *  @note Can be called from @b any thread at any time.
+     *  @note Must `try_spawn` again to re-use the pool.
+     *
+     *  When and how @b NOT to use this function:
+     *  - as a synchronization point between concurrent tasks.
+     *
+     *  When and how to use this function:
+     *  - as a de-facto @b destructor, to stop all threads and deallocate the pool.
+     *  - when you want to @b restart with a different number of threads.
+     */
+    void terminate() noexcept {
+        assert(threads_to_sync_.load(std::memory_order_seq_cst) == 0); // ! No tasks must be running
+        if (pthreads_count_ == 0) return;                              // ? Uninitialized
+
+        numa_pthread_allocator_t pthread_allocator {allocator_};
+
+        // Stop all threads and wait for them to finish
+        mood_.store(mood_t::die_k, std::memory_order_release);
+
+        caller_exclusivity_t const exclusivity = caller_exclusivity();
+        bool const use_caller_thread = exclusivity == caller_inclusive_k;
+        thread_index_t const threads = pthreads_count_;
+        for (thread_index_t i = use_caller_thread; i != threads; ++i) {
+            void *returned_value = nullptr;
+            pthread_t const pthread_handle = pthreads_[i].handle.load(std::memory_order_relaxed);
+            int const join_result = ::pthread_join(pthread_handle, &returned_value);
+            assert(join_result == 0 && "Thread join failed");
+        }
+
+        // Deallocate the handles and IDs
+        pthread_allocator.deallocate(pthreads_, threads);
+
+        // Prepare for future spawns
+        pthreads_count_ = 0;
+        pthreads_ = nullptr;
+
+        // Unpin the caller thread if it was part of this pool and was pinned to the NUMA node.
+        if (use_caller_thread) _reset_affinity();
+        _reset_fork();
+
+        mood_.store(mood_t::grind_k, std::memory_order_relaxed);
+        epoch_.store(0, std::memory_order_relaxed);
+    }
+
+    /**
+     *  @brief Transitions "workers" to a sleeping state, waiting for a wake-up call.
+     *  @param[in] wake_up_periodicity_micros How often to check for new work in microseconds.
+     *  @note Can only be called @b between the tasks for a single thread. No synchronization is performed.
+     *
+     *  This function may be used in some batch-processing operations when we clearly understand
+     *  that the next task won't be arriving for a while and power can be saved without major
+     *  latency penalties.
+     *
+     *  It may also be used in a high-level Python or JavaScript library offloading some parallel
+     *  operations to an underlying C++ engine, where latency is irrelevant.
+     */
+    void sleep(std::size_t wake_up_periodicity_micros) noexcept {
+        assert(wake_up_periodicity_micros > 0 && "Sleep length must be positive");
+        sleep_length_micros_ = wake_up_periodicity_micros;
+        mood_.store(mood_t::chill_k, std::memory_order_release);
+
+        // On Linux we can update the thread's scheduling class to IDLE,
+        // which will reduce the power consumption:
+        caller_exclusivity_t const exclusivity = caller_exclusivity();
+        bool const use_caller_thread = exclusivity == caller_inclusive_k;
+        for (std::size_t i = use_caller_thread; i < pthreads_count_; ++i) {
+            pid_t const pthread_id = pthreads_[i].id.load(std::memory_order_acquire);
+            if (pthread_id < 0) continue; // ? Not set yet
+            sched_param param {};
+            ::sched_setscheduler(pthread_id, SCHED_IDLE, &param);
+        }
+    }
+
+  private:
+    void _reset_fork() noexcept {
+        fork_state_ = nullptr;
+        fork_trampoline_ = nullptr;
+    }
+
+    void _reset_affinity() noexcept {
+        int const count_possible_cpus = numa_num_possible_cpus();
+        cpu_set_t *cpu_set_ptr = CPU_ALLOC(count_possible_cpus);
+        if (!cpu_set_ptr) return;
+        CPU_ZERO(cpu_set_ptr);
+        for (int cpu = 0; cpu < count_possible_cpus; ++cpu) CPU_SET(cpu, cpu_set_ptr);
+        ::sched_setaffinity(0, CPU_ALLOC_SIZE(count_possible_cpus), cpu_set_ptr);
+        CPU_FREE(cpu_set_ptr);
+        ::numa_run_on_node_mask_all(numa_all_cpus_ptr);
+    }
+
+    /**
+     *  @brief A trampoline function that is used to call the user-defined lambda.
+     *  @param[in] punned_lambda_pointer The pointer to the user-defined lambda.
+     *  @param[in] prong The index of the thread & task index packed together.
+     */
+    template <typename function_type_>
+    static void _call_as_lambda(punned_fork_context_t punned_lambda_pointer, thread_index_t thread_index) noexcept {
+        function_type_ const &lambda_object = *static_cast<function_type_ const *>(punned_lambda_pointer);
+        lambda_object(thread_index);
+    }
+
+    static void *_posix_worker_loop(void *arg) noexcept {
+        numa_thread_pool *pool = static_cast<numa_thread_pool *>(arg);
+
+        // Following section untile the main `while` loop may introduce race conditions,
+        // so spin-loop for a bit until the pool is ready.
+        mood_t mood;
+        micro_yield_t micro_yield;
+        while ((mood = pool->mood_.load(std::memory_order_acquire)) == mood_t::chill_k) micro_yield();
+
+        // If we are ready to start grinding, export this threads metadata to make it externally
+        // observable and controllable.
+        thread_index_t thread_index = -1;
+        if (mood == mood_t::grind_k) {
+            // We locate the thread index by enumerating the `pthreads_` array
+            numa_pthread_t *const numa_pthreads = pool->pthreads_;
+            thread_index_t const numa_pthreads_count = pool->pthreads_count_;
+            pthread_t const thread_handle = ::pthread_self();
+            for (thread_index = 0; thread_index < numa_pthreads_count; ++thread_index)
+                if (::pthread_equal(numa_pthreads[thread_index].handle.load(std::memory_order_relaxed), thread_handle))
+                    break;
+            assert(thread_index < numa_pthreads_count && "Thread index must be in [0, threads_count)");
+
+            // Assign the pthread ID to the shared memory
+            pid_t const pthread_id = ::gettid();
+            numa_pthreads[thread_index].id.store(pthread_id, std::memory_order_release);
+
+            // Ensure this function isn't used by the main caller
+            caller_exclusivity_t const exclusivity = pool->caller_exclusivity();
+            bool const use_caller_thread = exclusivity == caller_inclusive_k;
+            if (use_caller_thread) assert(thread_index != 0 && "The zero index is for the main thread, not worker!");
+        }
+
+        // Run the infinite loop, using Linux-specific napping mechanism
+        epoch_index_t last_epoch = 0;
+        epoch_index_t new_epoch;
+        while (true) {
+            // Wait for either: a new ticket or a stop flag
+            while ((new_epoch = pool->epoch_.load(std::memory_order_acquire)) == last_epoch &&
+                   (mood = pool->mood_.load(std::memory_order_acquire)) == mood_t::grind_k)
+                micro_yield();
+
+            if (_FU_UNLIKELY(mood == mood_t::die_k)) break;
+            if (_FU_UNLIKELY(mood == mood_t::chill_k) && (new_epoch == last_epoch)) {
+                struct timespec ts {0, static_cast<long>(pool->sleep_length_micros_ * 1000)};
+                ::clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
+                continue;
+            }
+
+            pool->fork_trampoline_(pool->fork_state_, thread_index);
+            last_epoch = new_epoch;
+
+            // ! The decrement must come after the task is executed
+            _FU_MAYBE_UNUSED thread_index_t const before_decrement =
+                pool->threads_to_sync_.fetch_sub(1, std::memory_order_release);
+            assert(before_decrement > 0 && "We can't be here if there are no worker threads");
+        }
+
+        return nullptr;
+    }
+
+    static void fill_thread_name(                          //
+        char16_name_t &output_name, char const *base_name, //
+        std::size_t const index, std::size_t const max_possible_cores) noexcept {
+
+        constexpr std::size_t max_visible_chars = sizeof(char16_name_t) - 1; // room left after the terminator
+        int const digits = max_possible_cores < 10      ? 1
+                           : max_possible_cores < 100   ? 2
+                           : max_possible_cores < 1000  ? 3
+                           : max_possible_cores < 10000 ? 4
+                                                        : 0; // fall‑through – let snprintf clip
+
+        if (digits == 0) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+            //  "%s:%zu" - worst‑case  (base up to 11 chars) + ":" + up‑to‑2‑digit index
+            std::snprintf(&output_name[0], sizeof(char16_name_t), "%s:%zu", base_name, index + 1);
+#pragma GCC diagnostic pop
+        }
+        else {
+            int const base_len = static_cast<int>(max_visible_chars - digits - 1); // -1 for ':'
+            // "%.*s" - truncates base_name to base_len
+            // "%0*zu" - prints zero‑padded index using exactly 'digits' characters
+            std::snprintf(&output_name[0], sizeof(char16_name_t), "%.*s:%0*zu", base_len, base_name, digits, index + 1);
+        }
+    }
+};
+
+/**
+ *  @brief A thread-pool addressing all of the threads across all NUMA nodes.
+ *
+ *  Differs from the `thread_pool` template in the following ways:
+ *  - constructor API: receives the NUMA nodes topology, & a name for threads.
+ *  - implementation of `try_spawn`: redirects to individual `numa_thread_pool` instances.
+ */
+template <typename micro_yield_type_ = standard_yield_t, std::size_t alignment_ = default_alignment_k>
+struct numa_thread_pools {
+
+    using numa_thread_pool_t = numa_thread_pool<micro_yield_type_, alignment_>;
+    using numa_topology_t = numa_topology<>;
+
+    using allocator_t = numa_allocator_t;
+    using micro_yield_t = typename numa_thread_pool_t::micro_yield_t;
+    using index_t = typename numa_thread_pool_t::index_t;
+    using epoch_index_t = typename numa_thread_pool_t::epoch_index_t;
+    using thread_index_t = typename numa_thread_pool_t::thread_index_t;
+
+  private:
+    numa_topology_t topology_ {};
+    char name_[16] {}; // ? Thread name buffer, for POSIX thread naming
+    thread_index_t threads_count_ {0};
+    caller_exclusivity_t exclusivity_ {caller_inclusive_k}; // ? Whether the caller thread is included in the count
+    numa_thread_pool_t **local_pools_ {nullptr};            // ? Array of thread pools for each NUMA node
+    std::size_t local_pools_count_ {0};                     // ? Number of NUMA nodes in the topology
+  public:
+    numa_thread_pools(numa_thread_pools &&) = delete;
+    numa_thread_pools(numa_thread_pools const &) = delete;
+    numa_thread_pools &operator=(numa_thread_pools &&) = delete;
+    numa_thread_pools &operator=(numa_thread_pools const &) = delete;
+
+    numa_thread_pools(numa_topology_t topo) noexcept : numa_thread_pools("fork_union", topo) {}
+    numa_thread_pools(char const *name, numa_topology_t topo) noexcept : topology_(topo) {
+        assert(name && "Thread name must not be null");
+        if (std::strlen(name_) == 0) { std::strncpy(name_, "fork_union", sizeof(name_) - 1); } // ? Default name
+        else { std::strncpy(name_, name, sizeof(name_) - 1), name_[sizeof(name_) - 1] = '\0'; }
+    }
+
+    ~numa_thread_pools() noexcept {}
+
+    /**
+     *  @brief Returns the number of threads in the thread-pool, including the main thread.
+     *  @retval 0 if the thread-pool is not initialized, 1 if only the main thread is used.
+     *  @note This API is @b not synchronized.
+     */
+    thread_index_t threads_count() const noexcept { return threads_count_; }
+
+    /**
+     *  @brief Reports if the current calling thread will be used for broadcasts.
+     *  @note This API is @b not synchronized.
+     */
+    caller_exclusivity_t caller_exclusivity() const noexcept { return exclusivity_; }
+
+    /**
+     *  @brief Estimates the amount of memory managed by this pool handle and internal structures.
+     *  @note This API is @b not synchronized.
+     */
+    std::size_t memory_usage() const noexcept {
+        std::size_t total_bytes = sizeof(numa_thread_pools);
+        for (std::size_t i = 0; i < local_pools_count_; ++i) {
+            numa_thread_pool_t *pool = local_pools_[i];
+            total_bytes += pool->memory_usage();
+        }
+        return total_bytes;
+    }
+
+    /** @brief Checks if the thread-pool's core synchronization points are lock-free. */
+    bool is_lock_free() const noexcept { return local_pools_ && local_pools_[0] && local_pools_[0]->is_lock_free(); }
+
+    template <typename function_type_>
+    void broadcast(function_type_ const &function) noexcept {
+        assert(local_pools_ && "Thread pools must be initialized before broadcasting");
+
+        for (std::size_t i = 0; i < local_pools_count_; ++i) {
+            numa_thread_pool_t *pool = local_pools_[i];
+            assert(pool && "NUMA thread pool must not be null");
+            pool->unsafe_broadcast(function);
+        }
+        for (std::size_t i = 0; i < local_pools_count_; ++i) {
+            numa_thread_pool_t *pool = local_pools_[i];
+            assert(pool && "NUMA thread pool must not be null");
+            pool->unsafe_join();
+        }
+    }
+};
 
 using numa_thread_pool_t = numa_thread_pool<>;
 using numa_thread_pools_t = numa_thread_pools<>;
