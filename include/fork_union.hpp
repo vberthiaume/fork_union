@@ -785,18 +785,19 @@ struct numa_topology {
         // These counters are reused in the failure handler
         std::size_t fetched_nodes = 0, fetched_cores = 0;
 
-        if (numa_available() < 0) goto failed_harvest; // ! Linux kernel lacks NUMA support
+        if (::numa_available() < 0) goto failed_harvest; // ! Linux kernel lacks NUMA support
+        ::numa_node_to_cpu_update();                     // ? Reset the outdated stale state
 
-        numa_mask = numa_allocate_cpumask();
+        numa_mask = ::numa_allocate_cpumask();
         if (!numa_mask) goto failed_harvest; // ! Allocation failed
 
         // First pass – measure
-        max_numa_node_id = numa_max_node();
+        max_numa_node_id = ::numa_max_node();
         for (numa_node_id_t node_id = 0; node_id <= max_numa_node_id; ++node_id) {
             long long dummy;
-            if (numa_node_size64(node_id, &dummy) < 0) continue; // ! Offline node
-            numa_bitmask_clearall(numa_mask);
-            if (numa_node_to_cpus(node_id, numa_mask) < 0) continue; // ! Invalid CPU map
+            if (::numa_node_size64(node_id, &dummy) < 0) continue; // ! Offline node
+            ::numa_bitmask_clearall(numa_mask);
+            if (::numa_node_to_cpus(node_id, numa_mask) < 0) continue; // ! Invalid CPU map
             std::size_t const node_cores = static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
             assert(node_cores > 0 && "Node must have at least one core");
             fetched_nodes += 1;
@@ -810,22 +811,25 @@ struct numa_topology {
         if (!nodes_ptr || !core_ids_ptr) goto failed_harvest; // ! Allocation failed
 
         // Populate
-        for (numa_node_id_t node_id = 0, core_id = 0; node_id <= max_numa_node_id; ++node_id) {
+        for (numa_node_id_t node_id = 0, core_index = 0, node_index = 0; node_id <= max_numa_node_id; ++node_id) {
             long long memory_size;
-            if (numa_node_size64(node_id, &memory_size) < 0) continue;
-            numa_bitmask_clearall(numa_mask);
-            if (numa_node_to_cpus(node_id, numa_mask) < 0) continue;
+            if (::numa_node_size64(node_id, &memory_size) < 0) continue;
+            ::numa_bitmask_clearall(numa_mask);
+            if (::numa_node_to_cpus(node_id, numa_mask) < 0) continue;
 
-            numa_node_t &node = nodes_ptr[node_id];
+            numa_node_t &node = nodes_ptr[node_index];
             node.node_id = node_id;
             node.memory_size = static_cast<std::size_t>(memory_size);
-            node.first_core_id = core_ids_ptr + core_id;
+            node.first_core_id = core_ids_ptr + core_index;
             node.core_count = static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
+            assert(node.core_count > 0 && "Node is known to have at least one core");
 
             // Most likely, this will fill `core_ids_ptr` with `std::iota`-like values
             for (std::size_t bit_offset = 0; bit_offset < numa_mask->size; ++bit_offset)
-                if (numa_bitmask_isbitset(numa_mask, bit_offset))
-                    core_ids_ptr[core_id++] = static_cast<numa_core_id_t>(bit_offset);
+                if (::numa_bitmask_isbitset(numa_mask, bit_offset))
+                    core_ids_ptr[core_index++] = static_cast<numa_core_id_t>(bit_offset);
+
+            node_index++;
         }
 
         // Commit
@@ -1035,7 +1039,7 @@ struct numa_thread_pool {
 
         // Allocate the `cpu_set_t` structure, assuming we may be on a machine
         // with a ridiculously large number of cores.
-        std::size_t const max_possible_cores = std::thread::hardware_concurrency();
+        int const max_possible_cores = ::numa_num_possible_cpus();
         cpu_set_t *cpu_set_ptr = CPU_ALLOC(max_possible_cores);
 
         // Before we start the threads, make sure we set some of the shared
@@ -1093,7 +1097,10 @@ struct numa_thread_pool {
         // Name all of the threads
         char16_name_t name;
         for (thread_index_t i = 0; i < pthreads_count_; ++i) {
-            fill_thread_name(name, name_, static_cast<std::size_t>(node.first_core_id[i]), max_possible_cores);
+            fill_thread_name(                                    //
+                name, name_,                                     //
+                static_cast<std::size_t>(node.first_core_id[i]), //
+                static_cast<std::size_t>(max_possible_cores));
             pthread_t pthread_handle = pthreads_[i].handle.load(std::memory_order_relaxed);
             int naming_result = ::pthread_setname_np(pthread_handle, name);
             assert(naming_result == 0 && "Failed to name a thread");
@@ -1298,14 +1305,18 @@ struct numa_thread_pool {
     }
 
     void _reset_affinity() noexcept {
-        int const count_possible_cpus = numa_num_possible_cpus();
-        cpu_set_t *cpu_set_ptr = CPU_ALLOC(count_possible_cpus);
+        int const max_possible_cores = ::numa_num_possible_cpus();
+        cpu_set_t *cpu_set_ptr = CPU_ALLOC(max_possible_cores);
         if (!cpu_set_ptr) return;
         CPU_ZERO(cpu_set_ptr);
-        for (int cpu = 0; cpu < count_possible_cpus; ++cpu) CPU_SET(cpu, cpu_set_ptr);
-        ::sched_setaffinity(0, CPU_ALLOC_SIZE(count_possible_cpus), cpu_set_ptr);
+        for (int cpu = 0; cpu < max_possible_cores; ++cpu) CPU_SET(cpu, cpu_set_ptr);
+        int sched_result = ::sched_setaffinity(::gettid(), CPU_ALLOC_SIZE(max_possible_cores), cpu_set_ptr);
+        assert(sched_result == 0 && "Failed to reset the caller thread's scheduling affinity");
+        int pin_result = ::pthread_setaffinity_np(::pthread_self(), CPU_ALLOC_SIZE(max_possible_cores), cpu_set_ptr);
+        assert(pin_result == 0 && "Failed to reset the caller thread's affinity");
         CPU_FREE(cpu_set_ptr);
-        ::numa_run_on_node_mask_all(numa_all_cpus_ptr);
+        int spread_result = ::numa_run_on_node(-1); // !? Shouldn't it be `numa_all_nodes`
+        assert(spread_result == 0 && "Failed to reset the caller thread's NUMA node affinity");
     }
 
     /**
