@@ -444,29 +444,16 @@ void for_slices(                                                 //
     thread_index_t const threads_count = pool.threads();
     if (threads_count == 1 || prongs_count == 1) return function(prong_t {0, 0}, prongs_count);
 
-    // Divide and round-up the workload size per thread - assuming some fuzzer may
-    // pass an absurdly large `prongs_count` as an input, the addition may overflow,
-    // so `(prongs_count + threads_count - 1) / threads_count` is not the safest option.
-    // Instead, we can do: `prongs_count / threads_count + (prongs_count % threads_count != 0)`,
-    // but avoiding the cost of the second integer division, replacing it with multiplication.
-    index_t const tasks_per_thread_lower_bound = prongs_count / threads_count;
-    index_t const tasks_per_thread =
-        tasks_per_thread_lower_bound + ((tasks_per_thread_lower_bound * threads_count) < prongs_count);
+    // The first (N % M) chunks have size ceil(N/M)
+    // The remaining N - (N % M) chunks have size floor(N/M)
+    //     where N = prongs_count, M = threads_count
+    // See https://lemire.me/blog/2025/05/22/dividing-an-array-into-fair-sized-chunks/
+    index_t const quotient = prongs_count / threads_count;
+    index_t const remainder = prongs_count % threads_count;
 
-    pool.broadcast([prongs_count, tasks_per_thread, tasks_per_thread_lower_bound,
-                    function](thread_index_t const thread_index) noexcept {
-        // Multiplying `thread_index` by `tasks_per_thread` may overflow. For an 8-bit `index_t` type:
-        // - 254 threads,
-        // - 255 tasks,
-        // - each thread gets 1 or 2 tasks
-        // In that case, both `begin` and `begin_lower_bound` will overflow, but we can use
-        // their relative values to determine the real slice length for the thread.
-        index_t const begin = thread_index * tasks_per_thread;                         // ? Handled overflow
-        index_t const begin_lower_bound = tasks_per_thread_lower_bound * thread_index; // ? Handled overflow
-        bool const begin_overflows = begin_lower_bound > begin;
-        bool const begin_exceeds_n = begin >= prongs_count;
-        if (begin_overflows || begin_exceeds_n) return;
-        index_t const count = (std::min<index_t>)(add_sat(begin, tasks_per_thread), prongs_count) - begin;
+    pool.broadcast([quotient, remainder, function](thread_index_t const thread_index) noexcept {
+        index_t const begin = quotient * thread_index + (thread_index < remainder ? thread_index : remainder);
+        index_t const count = quotient + (thread_index < remainder ?  1 : 0);
         function(prong_t {thread_index, begin}, count);
     });
 }
