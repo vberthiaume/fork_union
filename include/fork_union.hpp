@@ -798,7 +798,7 @@ struct numa_topology {
             if (::numa_node_size64(node_id, &dummy) < 0) continue; // ! Offline node
             ::numa_bitmask_clearall(numa_mask);
             if (::numa_node_to_cpus(node_id, numa_mask) < 0) continue; // ! Invalid CPU map
-            std::size_t const node_cores = static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
+            std::size_t const node_cores = static_cast<std::size_t>(::numa_bitmask_weight(numa_mask));
             assert(node_cores > 0 && "Node must have at least one core");
             fetched_nodes += 1;
             fetched_cores += node_cores;
@@ -821,7 +821,7 @@ struct numa_topology {
             node.node_id = node_id;
             node.memory_size = static_cast<std::size_t>(memory_size);
             node.first_core_id = core_ids_ptr + core_index;
-            node.core_count = static_cast<std::size_t>(numa_bitmask_weight(numa_mask));
+            node.core_count = static_cast<std::size_t>(::numa_bitmask_weight(numa_mask));
             assert(node.core_count > 0 && "Node is known to have at least one core");
 
             // Most likely, this will fill `core_ids_ptr` with `std::iota`-like values
@@ -838,13 +838,13 @@ struct numa_topology {
         nodes_count_ = fetched_nodes;
         cores_count_ = fetched_cores;
 
-        numa_free_cpumask(numa_mask); // ? Clean up
+        ::numa_free_cpumask(numa_mask); // ? Clean up
         return true;
 
     failed_harvest:
         if (nodes_ptr) nodes_alloc.deallocate(nodes_ptr, fetched_nodes);
         if (core_ids_ptr) cores_alloc.deallocate(core_ids_ptr, fetched_cores);
-        if (numa_mask) numa_free_cpumask(numa_mask);
+        if (numa_mask) ::numa_free_cpumask(numa_mask);
         return false;
     }
 };
@@ -1310,8 +1310,6 @@ struct numa_thread_pool {
         if (!cpu_set_ptr) return;
         CPU_ZERO(cpu_set_ptr);
         for (int cpu = 0; cpu < max_possible_cores; ++cpu) CPU_SET(cpu, cpu_set_ptr);
-        int sched_result = ::sched_setaffinity(::gettid(), CPU_ALLOC_SIZE(max_possible_cores), cpu_set_ptr);
-        assert(sched_result == 0 && "Failed to reset the caller thread's scheduling affinity");
         int pin_result = ::pthread_setaffinity_np(::pthread_self(), CPU_ALLOC_SIZE(max_possible_cores), cpu_set_ptr);
         assert(pin_result == 0 && "Failed to reset the caller thread's affinity");
         CPU_FREE(cpu_set_ptr);

@@ -28,14 +28,10 @@ struct make_pool_t {
 };
 
 #if FU_ENABLE_NUMA
+static fu::numa_topology_t numa_topology;
 struct make_numa_pool_t {
-    fu::numa_topology_t topology_;
-    make_numa_pool_t() noexcept {
-        bool const harvested = topology_.try_harvest();
-        assert(harvested && "Failed to harvest NUMA topology");
-    }
     fu::numa_thread_pool_t construct() const noexcept { return fu::numa_thread_pool_t("fork_union"); }
-    fu::numa_node_t scope(std::size_t = 0) const noexcept { return topology_.node(0); }
+    fu::numa_node_t scope(std::size_t = 0) const noexcept { return numa_topology.node(0); }
 };
 #endif
 
@@ -338,20 +334,20 @@ static bool stress_test_composite(std::size_t const threads_count, std::size_t c
 
 void log_numa_topology(void) {
 #if FU_ENABLE_NUMA
-    fu::numa_topology topo;
-    if (!topo.try_harvest()) {
+    if (!numa_topology.try_harvest()) {
         std::fprintf(stderr, "Failed to harvest NUMA topology\n");
-        return;
+        exit(EXIT_FAILURE);
     }
 
     std::printf("Harvested NUMA topology:\n");
-    std::printf("- %zu nodes, %zu threads\n", topo.nodes_count(), topo.threads_count());
-    for (std::size_t i = 0; i < topo.nodes_count(); ++i) {
-        auto const n = topo.node(i);
+    std::printf("- %zu nodes, %zu threads\n", numa_topology.nodes_count(), numa_topology.threads_count());
+    for (std::size_t i = 0; i < numa_topology.nodes_count(); ++i) {
+        auto const n = numa_topology.node(i);
         std::printf("- node %d : %zu MiB, %zu cores: %d...%d\n",  //
                     n.node_id, n.memory_size >> 20, n.core_count, //
                     n.first_core_id[0], n.first_core_id[n.core_count - 1]);
     }
+    std::printf("Current process ID: %d\n", ::getpid());
 #endif
 }
 
@@ -366,18 +362,18 @@ int main(void) {
         char const *name;
         test_func_t *function;
     } const unit_tests[] = {
-    // {"`try_spawn` zero threads", test_try_spawn_zero},                                  //
-    // {"`try_spawn` normal", test_try_spawn_success},                                     //
-    // {"`broadcast` dispatch", test_broadcast},                                           //
-    // {"`caller_exclusive_k` calls", test_exclusivity},                                   //
-    // {"`for_n` for uncomfortable input size", test_uncomfortable_input_size},            //
-    // {"`for_n` static scheduling", test_for_n},                                          //
-    // {"`for_n_dynamic` dynamic scheduling", test_for_n_dynamic},                         //
-    // {"`for_n_dynamic` oversubscribed threads", test_oversubscribed_unbalanced_threads}, //
-    // {"`terminate` avoided", test_mixed_restart<false>},                                 //
-    // {"`terminate` and re-spawn", test_mixed_restart<true>},                             //
+        {"`try_spawn` zero threads", test_try_spawn_zero},                                  //
+        {"`try_spawn` normal", test_try_spawn_success},                                     //
+        {"`broadcast` dispatch", test_broadcast},                                           //
+        {"`caller_exclusive_k` calls", test_exclusivity},                                   //
+        {"`for_n` for uncomfortable input size", test_uncomfortable_input_size},            //
+        {"`for_n` static scheduling", test_for_n},                                          //
+        {"`for_n_dynamic` dynamic scheduling", test_for_n_dynamic},                         //
+        {"`for_n_dynamic` oversubscribed threads", test_oversubscribed_unbalanced_threads}, //
+        {"`terminate` avoided", test_mixed_restart<false>},                                 //
+        {"`terminate` and re-spawn", test_mixed_restart<true>},                             //
 #if FU_ENABLE_NUMA
-        // {"NUMA `try_spawn` normal", test_try_spawn_success<make_numa_pool_t>},                                     //
+        {"NUMA `try_spawn` normal", test_try_spawn_success<make_numa_pool_t>},                                     //
         {"NUMA `broadcast` dispatch", test_broadcast<make_numa_pool_t>},                                           //
         {"NUMA `caller_exclusive_k` calls", test_exclusivity<make_numa_pool_t>},                                   //
         {"NUMA `for_n` for uncomfortable input size", test_uncomfortable_input_size<make_numa_pool_t>},            //
