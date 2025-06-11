@@ -350,7 +350,7 @@ class thread_pool {
         while (true) {
             // Wait for either: a new ticket or a stop flag
             generation_index_t new_fork_generation;
-            bool wants_to_stop;
+            bool wants_to_stop {false};
             while ((new_fork_generation = fork_generation_.load(std::memory_order_acquire)) == last_fork_generation &&
                    (wants_to_stop = stop_.load(std::memory_order_acquire)) == false)
                 std::this_thread::yield();
