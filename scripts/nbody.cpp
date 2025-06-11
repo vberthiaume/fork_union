@@ -38,7 +38,7 @@
 #include <span>   // `std::span`
 #include <bit>    // `std::bit_cast`
 
-#if defined(_OPENMP)
+#if 0 //defined(_OPENMP)
 #include <omp.h>
 #endif
 
