@@ -159,7 +159,6 @@ void iteration_fork_union_dynamic(fun::thread_pool_t &pool, body_t *_FU_RESTRICT
 #pragma endregion - Backends
 
 int main() {
-#if 1
     // Read env vars
     std::size_t n = std::stoul(std::getenv("NBODY_COUNT") ?: "0");
     std::size_t const iterations = std::stoul(std::getenv("NBODY_ITERATIONS") ?: "1000");
@@ -218,5 +217,4 @@ int main() {
 
     std::fprintf(stderr, "Unsupported backend: %s\n", backend.data());
     return EXIT_FAILURE;
-#endif
 }
