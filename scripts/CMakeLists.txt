@@ -33,7 +33,8 @@ foreach (STD IN LISTS CXX_STANDARDS)
     # Create the executable
     add_executable(${TGT} ${TEST_SOURCES})
     set_target_properties(
-        ${target_name}
+        # ${target_name}
+        ${TGT}
         PROPERTIES CXX_STANDARD ${STD}
                    CXX_STANDARD_REQUIRED ON
                    CXX_EXTENSIONS OFF
