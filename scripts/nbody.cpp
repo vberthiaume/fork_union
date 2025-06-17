@@ -38,8 +38,6 @@
 #include <span>   // `std::span`
 #include <bit>    // `std::bit_cast`
 
-#undef _OPENMP
-
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
