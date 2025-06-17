@@ -37,6 +37,7 @@
 #include <thread> // `std::thread::hardware_concurrency`
 #include <span>   // `std::span`
 #include <bit>    // `std::bit_cast`
+#include <string>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -158,10 +159,11 @@ void iteration_fork_union_dynamic(fun::thread_pool_t &pool, body_t *_FU_RESTRICT
 
 int main() {
     // Read env vars
-    std::size_t n = std::stoul(std::getenv("NBODY_COUNT") ?: "0");
-    std::size_t const iterations = std::stoul(std::getenv("NBODY_ITERATIONS") ?: "1000");
+    std::size_t n = std::stoul(std::getenv("NBODY_COUNT") ? std::getenv("NBODY_COUNT") : "0");
+    std::size_t const iterations =
+        std::stoul(std::getenv("NBODY_ITERATIONS") ? std::getenv("NBODY_ITERATIONS") : "1000");
     std::string_view const backend = std::getenv("NBODY_BACKEND") ? std::getenv("NBODY_BACKEND") : "fork_union_static";
-    std::size_t threads = std::stoul(std::getenv("NBODY_THREADS") ?: "0");
+    std::size_t threads = std::stoul(std::getenv("NBODY_THREADS") ? std::getenv("NBODY_THREADS") : "0");
     if (threads == 0) threads = std::thread::hardware_concurrency();
     if (n == 0) n = threads;
 
